@@ -119,21 +119,27 @@ if abs(trace_P_S) > 1e-10:
 print(f"   Density matrix shape: {P.shape}")
 print(f"   Density matrix trace: {np.trace(P):.4f}")
 
-# 5. Evaluate meta-GGA variables (would require full implementation)
+# 5. Evaluate meta-GGA variables
 print("\n5. Meta-GGA variable evaluation...")
-print("   Note: Full vvar evaluation requires complete integrator binding")
-print("   This is a placeholder showing the intended API:")
-print()
-print("   # This would evaluate rho, grad, gamma, tau on the grid:")
-print("   # vvars = gxc.eval_mgga_vvars(")
-print("   #     mol, basis, grid, P,")
-print("   #     ks_scheme='RKS',")
-print("   #     need_lapl=False")
-print("   # )")
-print("   # print(f'   rho shape: {vvars.rho.shape}')")
-print("   # print(f'   grad shape: {vvars.grad.shape}')")
-print("   # print(f'   gamma shape: {vvars.gamma.shape}')")
-print("   # print(f'   tau shape: {vvars.tau.shape}')")
+print("   Evaluating density and related quantities on the grid...")
+
+try:
+    vvars = gxc.eval_mgga_vvars(
+        mol, basis, grid, P,
+        ks_scheme='RKS',
+        need_lapl=False
+    )
+    print(f"   ✓ Successfully evaluated meta-GGA variables")
+    print(f"   rho shape: {vvars.rho.shape}")
+    print(f"   grad shape: {vvars.grad.shape}")
+    print(f"   gamma shape: {vvars.gamma.shape}")
+    print(f"   tau shape: {vvars.tau.shape}")
+    print(f"   Sample density values:")
+    print(f"     rho[0:5] = {vvars.rho[:5]}")
+    print(f"     Sum of rho*weights = {np.sum(vvars.rho * grid.weights):.6f} electrons")
+except Exception as e:
+    print(f"   ✗ Error evaluating variables: {e}")
+    print("   This may indicate a build or dependency issue")
 
 print("\n" + "=" * 60)
 print("Example completed successfully!")
@@ -153,7 +159,9 @@ try:
     print(f"   Converted coords to torch: {coords_torch.shape}, dtype={coords_torch.dtype}")
     print(f"   Converted P to torch: {P_torch.shape}, dtype={P_torch.dtype}")
     
-    # Could use grid.to_torch() if grid were a GridData object
+    # Convert grid to torch
+    grid_torch = grid.to_torch()
+    print(f"   Converted grid to torch: {grid_torch.points.shape}")
     
 except ImportError:
     print("   PyTorch not available (optional)")

@@ -39,7 +39,7 @@ __all__ = [
     'create_simple_shell',
     'create_molgrid',
     'extract_grid_data',
-    'eval_mgga_vvars_stub',
+    'eval_mgga_vvars_impl',
     'supports_torch',
 ]
 

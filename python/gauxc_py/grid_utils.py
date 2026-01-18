@@ -20,6 +20,7 @@ class GridData:
     points: np.ndarray  # (npts, 3) grid point coordinates
     weights: np.ndarray  # (npts,) quadrature weights
     npts: int  # Total number of points
+    molgrid: 'MolGrid' = None  # The underlying MolGrid object
     
     def to_torch(self):
         """Convert to PyTorch tensors (if available)."""
@@ -28,7 +29,8 @@ class GridData:
             return GridData(
                 points=torch.from_numpy(self.points),
                 weights=torch.from_numpy(self.weights),
-                npts=self.npts
+                npts=self.npts,
+                molgrid=self.molgrid
             )
         except ImportError:
             raise ImportError("PyTorch is not installed")
@@ -126,7 +128,8 @@ def compute_grid(
     grid_data = GridData(
         points=grid_dict['points'],
         weights=grid_dict['weights'],
-        npts=grid_dict['npts']
+        npts=grid_dict['npts'],
+        molgrid=molgrid
     )
     
     # Convert to torch if requested
