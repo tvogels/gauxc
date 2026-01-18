@@ -1,10 +1,22 @@
 #!/bin/bash
 # Test script for building GauXC Python bindings
+#
+# Usage: ./test_build.sh <path_to_gauxc_source>
 
 set -e
 
+# Get source directory from argument or use current directory
+GAUXC_SOURCE="${1:-$(pwd)}"
+
+if [ ! -f "$GAUXC_SOURCE/CMakeLists.txt" ]; then
+    echo "Error: Not a valid GauXC source directory: $GAUXC_SOURCE"
+    echo "Usage: $0 <path_to_gauxc_source>"
+    exit 1
+fi
+
 echo "================================================"
 echo "GauXC Python Bindings Build Test"
+echo "Source directory: $GAUXC_SOURCE"
 echo "================================================"
 
 # Check prerequisites
@@ -33,7 +45,7 @@ python3 -c "import scikit_build_core; print('   ✓ scikit-build-core installed'
 # Configure build
 echo ""
 echo "3. Configuring CMake build..."
-BUILD_DIR="/tmp/gauxc_test_build"
+BUILD_DIR="${BUILD_DIR:-/tmp/gauxc_test_build}"
 rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
@@ -42,7 +54,7 @@ cmake -DGAUXC_ENABLE_PYTHON=ON \
       -DGAUXC_ENABLE_TESTS=OFF \
       -DGAUXC_ENABLE_MPI=OFF \
       -DGAUXC_ENABLE_HDF5=OFF \
-      /path/to/gauxc
+      "$GAUXC_SOURCE"
 
 # Build
 echo ""
@@ -52,7 +64,7 @@ cmake --build . -j$(nproc)
 # Install
 echo ""
 echo "5. Installing Python package..."
-pip3 install -e /path/to/gauxc
+pip3 install -e "$GAUXC_SOURCE"
 
 # Test import
 echo ""

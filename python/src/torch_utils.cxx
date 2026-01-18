@@ -21,7 +21,13 @@ void bind_torch_utils(py::module& m) {
     
     m.def("supports_torch", []() {
         // Check if torch is available at runtime
-        return py::module_::import("importlib.util").attr("find_spec")("torch").is_none() == false;
+        try {
+            auto importlib = py::module_::import("importlib.util");
+            auto spec = importlib.attr("find_spec")("torch");
+            return !spec.is_none();
+        } catch (...) {
+            return false;
+        }
     }, "Check if PyTorch is available");
     
     // Note: Actual DLPack tensor conversion will be handled in Python layer
