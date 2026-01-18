@@ -40,6 +40,7 @@ __all__ = [
     'create_molgrid',
     'extract_grid_data',
     'eval_mgga_vvars_impl',
+    'eval_mgga_vvars_impl_uks',
     'supports_torch',
 ]
 

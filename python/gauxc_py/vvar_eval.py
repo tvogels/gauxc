@@ -57,7 +57,7 @@ def eval_mgga_vvars(
     mol: Molecule,
     basis: BasisSet,
     grid: Union[GridData, MolGrid],
-    P: np.ndarray,
+    P: Union[np.ndarray, tuple, list],
     ks_scheme: str = "RKS",
     need_lapl: bool = False,
     exec_space: Union[str, ExecutionSpace] = "host",
@@ -79,12 +79,16 @@ def eval_mgga_vvars(
         The basis set
     grid : GridData or MolGrid
         The molecular grid (from compute_grid or create_molgrid)
-    P : numpy.ndarray or torch.Tensor
-        Density matrix (nbf x nbf, symmetric)
-        Can be CPU or GPU tensor; will be handled appropriately
+    P : numpy.ndarray, torch.Tensor, or tuple/list of arrays
+        Density matrix or matrices:
+        - RKS: Single array (nbf, nbf) - symmetric density matrix
+        - UKS: Tuple/list of two arrays [(nbf, nbf), (nbf, nbf)] 
+               for spin-up and spin-down density matrices [Ps, Pz]
+        Can be CPU or GPU tensors; will be handled appropriately
     ks_scheme : str
-        Kohn-Sham scheme: 'RKS', 'UKS', or 'GKS' (default: 'RKS')
-        Note: Currently only RKS is implemented
+        Kohn-Sham scheme: 'RKS' or 'UKS' (default: 'RKS')
+        - 'RKS': Restricted (single density matrix)
+        - 'UKS': Unrestricted (two density matrices for spin-up/down)
     need_lapl : bool
         Whether to compute Laplacian (default: False)
     exec_space : str or ExecutionSpace
@@ -99,6 +103,7 @@ def eval_mgga_vvars(
     --------
     MGGAVariables
         Computed meta-GGA variables (rho, grad, gamma, tau, lapl)
+        For UKS: rho contains total density (alpha + beta)
         
     Notes:
     ------
@@ -118,46 +123,107 @@ def eval_mgga_vvars(
     When exec_space='host' (default):
     - GPU tensors are automatically copied to CPU for computation
     - Results are returned on CPU
+    
+    Device Consistency:
+    -------------------
+    For UKS, all density matrices must be on the same device.
+    An error will be raised if matrices are on different devices.
     """
+    # Normalize KS scheme
+    ks_scheme = ks_scheme.upper()
+    
+    # Handle UKS input (tuple/list of density matrices)
+    is_uks = False
+    if isinstance(P, (tuple, list)):
+        if len(P) != 2:
+            raise ValueError(
+                f"UKS requires exactly 2 density matrices (Ps, Pz), got {len(P)}"
+            )
+        is_uks = True
+        Ps, Pz = P
+        
+        # Check device consistency
+        if hasattr(Ps, 'device') and hasattr(Pz, 'device'):
+            if Ps.device != Pz.device:
+                raise ValueError(
+                    f"Density matrices must be on the same device. "
+                    f"Got Ps on {Ps.device} and Pz on {Pz.device}"
+                )
+        
+        # Auto-detect UKS if not specified
+        if ks_scheme == "RKS":
+            import warnings
+            warnings.warn(
+                "Detected 2 density matrices but ks_scheme='RKS'. "
+                "Auto-switching to ks_scheme='UKS'",
+                UserWarning
+            )
+            ks_scheme = "UKS"
+    else:
+        # Single matrix - must be RKS
+        if ks_scheme == "UKS":
+            raise ValueError(
+                "UKS requires 2 density matrices [Ps, Pz]. "
+                "Pass as tuple: P=(Ps, Pz)"
+            )
+        Ps = P
+        Pz = None
+    
     # Detect if input is a torch tensor and its device
     input_device = None
     is_torch = False
     
-    if hasattr(P, 'device'):  # torch tensor
-        is_torch = True
-        try:
-            import torch
-            input_device = P.device
-            
-            # Automatic exec_space detection based on tensor device
-            if exec_space == "host" or isinstance(exec_space, ExecutionSpace) and exec_space == ExecutionSpace.Host:
-                if P.is_cuda or (hasattr(P, 'is_hip') and P.is_hip):
-                    # GPU tensor but host execution - need to copy to CPU
-                    P = P.cpu().numpy()
-                else:
-                    P = P.numpy()
-            else:  # Device execution
-                # Check if tensor is on GPU
-                if not (P.is_cuda or (hasattr(P, 'is_hip') and P.is_hip)):
-                    raise ValueError(
-                        "exec_space='device' requires GPU tensor input. "
-                        "Please move tensor to GPU first with tensor.cuda() or tensor.to('cuda')"
-                    )
-                # For device execution, we still need CPU copy for current implementation
-                # TODO: Add native GPU tensor support when GauXC supports device pointers directly
-                P = P.cpu().numpy()
-        except ImportError:
-            pass
-    elif hasattr(P, 'cpu'):  # torch tensor (older API check)
-        is_torch = True
-        P = P.cpu().numpy()
+    def process_tensor(tensor, name="P"):
+        """Process a single tensor, handling device conversion."""
+        nonlocal input_device, is_torch
+        
+        if hasattr(tensor, 'device'):  # torch tensor
+            is_torch = True
+            try:
+                import torch
+                curr_device = tensor.device
+                
+                # Set input_device from first tensor
+                if input_device is None:
+                    input_device = curr_device
+                
+                # Automatic exec_space detection based on tensor device
+                if exec_space == "host" or isinstance(exec_space, ExecutionSpace) and exec_space == ExecutionSpace.Host:
+                    if tensor.is_cuda or (hasattr(tensor, 'is_hip') and tensor.is_hip):
+                        # GPU tensor but host execution - need to copy to CPU
+                        return tensor.cpu().numpy()
+                    else:
+                        return tensor.numpy()
+                else:  # Device execution
+                    # Check if tensor is on GPU
+                    if not (tensor.is_cuda or (hasattr(tensor, 'is_hip') and tensor.is_hip)):
+                        raise ValueError(
+                            f"exec_space='device' requires GPU tensor input. "
+                            f"Please move {name} to GPU first with tensor.cuda() or tensor.to('cuda')"
+                        )
+                    # For device execution, we still need CPU copy for current implementation
+                    # TODO: Add native GPU tensor support when GauXC supports device pointers directly
+                    return tensor.cpu().numpy()
+            except ImportError:
+                pass
+        elif hasattr(tensor, 'cpu'):  # torch tensor (older API check)
+            is_torch = True
+            return tensor.cpu().numpy()
+        
+        return np.asarray(tensor, dtype=np.float64)
     
-    P = np.asarray(P, dtype=np.float64)
+    # Process density matrices
+    Ps_np = process_tensor(Ps, "Ps" if is_uks else "P")
+    Pz_np = process_tensor(Pz, "Pz") if Pz is not None else None
     
-    # Validate density matrix
+    # Validate density matrices
     nbf = basis.nbf()
-    if P.shape != (nbf, nbf):
-        raise ValueError(f"Density matrix shape {P.shape} doesn't match basis size {nbf}x{nbf}")
+    if Ps_np.shape != (nbf, nbf):
+        name = "Ps" if is_uks else "P"
+        raise ValueError(f"Density matrix {name} shape {Ps_np.shape} doesn't match basis size {nbf}x{nbf}")
+    
+    if is_uks and Pz_np.shape != (nbf, nbf):
+        raise ValueError(f"Density matrix Pz shape {Pz_np.shape} doesn't match basis size {nbf}x{nbf}")
     
     # Convert exec_space string to enum if needed
     if isinstance(exec_space, str):
@@ -174,13 +240,6 @@ def eval_mgga_vvars(
                 )
         exec_space = exec_map.get(exec_space.lower(), ExecutionSpace.Host)
     
-    # Check KS scheme (only RKS implemented currently)
-    if ks_scheme.upper() != "RKS":
-        raise NotImplementedError(
-            f"KS scheme '{ks_scheme}' not yet implemented. "
-            "Currently only 'RKS' (restricted) is supported."
-        )
-    
     # Extract MolGrid if GridData was passed
     if isinstance(grid, GridData):
         if grid.molgrid is None:
@@ -193,7 +252,11 @@ def eval_mgga_vvars(
         molgrid = grid
     
     # Call C++ implementation
-    result = eval_mgga_vvars_impl(mol, basis, molgrid, P, need_lapl, exec_space)
+    if is_uks:
+        result = eval_mgga_vvars_impl_uks(mol, basis, molgrid, Ps_np, Pz_np, 
+                                           need_lapl, exec_space)
+    else:
+        result = eval_mgga_vvars_impl(mol, basis, molgrid, Ps_np, need_lapl, exec_space)
     
     # Create MGGAVariables object
     vvars = MGGAVariables(

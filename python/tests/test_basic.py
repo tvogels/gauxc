@@ -206,6 +206,121 @@ class TestTorchIntegration:
             assert vvars_gpu.rho.device.type == 'cuda'
         except Exception as e:
             pytest.fail(f"Output to GPU failed: {e}")
+    
+    @pytest.mark.skipif(not GAUXC_AVAILABLE, reason="GauXC not installed")
+    def test_uks_support(self):
+        """Test UKS (unrestricted Kohn-Sham) support."""
+        # Create H2 molecule
+        z = np.array([1, 1], dtype=np.int32)
+        coords = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]], dtype=np.float64)
+        mol = gxc.molecule_from_arrays(z, coords)
+        
+        # Create minimal basis
+        basis = gxc.BasisSet()
+        alphas = np.array([3.4253, 0.6239, 0.1689], dtype=np.float64)
+        coeffs = np.array([0.1543, 0.5353, 0.4446], dtype=np.float64)
+        
+        for i in range(2):
+            shell = gxc.create_simple_shell(
+                1, 0, alphas, coeffs,
+                coords[i, 0], coords[i, 1], coords[i, 2]
+            )
+            basis.append(shell)
+        
+        # Generate grid
+        grid = gxc.compute_grid(
+            mol, basis,
+            pruning_scheme="robust",
+            batch_size=512,
+            grid_size="fine"
+        )
+        
+        # Create UKS density matrices
+        nbf = basis.nbf()
+        Ps = np.random.randn(nbf, nbf)
+        Ps = (Ps + Ps.T) / 2
+        Pz = np.random.randn(nbf, nbf) * 0.5
+        Pz = (Pz + Pz.T) / 2
+        
+        # Test UKS evaluation
+        vvars = gxc.eval_mgga_vvars(
+            mol, basis, grid, (Ps, Pz),
+            ks_scheme="UKS"
+        )
+        
+        assert vvars.rho.shape == (grid.npts,)
+        assert vvars.grad.shape == (grid.npts, 3)
+        assert vvars.gamma.shape == (grid.npts,)
+        assert vvars.tau.shape == (grid.npts,)
+    
+    @pytest.mark.skipif(not GAUXC_AVAILABLE, reason="GauXC not installed")
+    def test_uks_device_consistency(self):
+        """Test device consistency checking for UKS."""
+        try:
+            import torch
+        except ImportError:
+            pytest.skip("PyTorch not installed")
+        
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        
+        # Create molecule and basis
+        z = np.array([1, 1], dtype=np.int32)
+        coords = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]], dtype=np.float64)
+        mol = gxc.molecule_from_arrays(z, coords)
+        
+        basis = gxc.BasisSet()
+        alphas = np.array([3.4253, 0.6239, 0.1689], dtype=np.float64)
+        coeffs = np.array([0.1543, 0.5353, 0.4446], dtype=np.float64)
+        
+        for i in range(2):
+            shell = gxc.create_simple_shell(
+                1, 0, alphas, coeffs,
+                coords[i, 0], coords[i, 1], coords[i, 2]
+            )
+            basis.append(shell)
+        
+        grid = gxc.compute_grid(
+            mol, basis,
+            pruning_scheme="robust",
+            batch_size=512,
+            grid_size="fine"
+        )
+        
+        nbf = basis.nbf()
+        Ps_cpu = torch.randn(nbf, nbf, dtype=torch.float64)
+        Ps_cpu = (Ps_cpu + Ps_cpu.T) / 2
+        
+        Pz_cpu = torch.randn(nbf, nbf, dtype=torch.float64)
+        Pz_cpu = (Pz_cpu + Pz_cpu.T) / 2
+        
+        # Test: Consistent devices (both CPU) should work
+        vvars = gxc.eval_mgga_vvars(
+            mol, basis, grid, (Ps_cpu, Pz_cpu),
+            ks_scheme="UKS"
+        )
+        assert vvars.rho.shape == (grid.npts,)
+        
+        # Test: Inconsistent devices should fail
+        Ps_gpu = Ps_cpu.cuda()
+        Pz_cpu_2 = Pz_cpu  # Keep on CPU
+        
+        with pytest.raises(ValueError, match="must be on the same device"):
+            gxc.eval_mgga_vvars(
+                mol, basis, grid, (Ps_gpu, Pz_cpu_2),
+                ks_scheme="UKS"
+            )
+        
+        # Test: Both on GPU should work
+        Ps_gpu = Ps_cpu.cuda()
+        Pz_gpu = Pz_cpu.cuda()
+        
+        vvars_gpu = gxc.eval_mgga_vvars(
+            mol, basis, grid, (Ps_gpu, Pz_gpu),
+            ks_scheme="UKS",
+            exec_space="host"
+        )
+        assert vvars_gpu.rho.shape == (grid.npts,)
 
 
 if __name__ == "__main__":
