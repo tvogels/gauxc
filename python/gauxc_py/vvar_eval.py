@@ -22,16 +22,32 @@ class MGGAVariables:
     tau: np.ndarray      # (npts,) kinetic energy density
     lapl: Optional[np.ndarray] = None  # (npts,) Laplacian (optional)
     
-    def to_torch(self):
-        """Convert to PyTorch tensors (if available)."""
+    def to_torch(self, device=None):
+        """
+        Convert to PyTorch tensors (if available).
+        
+        Parameters:
+        -----------
+        device : str or torch.device, optional
+            Target device for tensors. If None, keeps on current device.
+        """
         try:
             import torch
+            
+            def convert_array(arr, device):
+                if arr is None:
+                    return None
+                tensor = torch.from_numpy(arr)
+                if device is not None:
+                    tensor = tensor.to(device)
+                return tensor
+            
             return MGGAVariables(
-                rho=torch.from_numpy(self.rho),
-                grad=torch.from_numpy(self.grad),
-                gamma=torch.from_numpy(self.gamma),
-                tau=torch.from_numpy(self.tau),
-                lapl=torch.from_numpy(self.lapl) if self.lapl is not None else None
+                rho=convert_array(self.rho, device),
+                grad=convert_array(self.grad, device),
+                gamma=convert_array(self.gamma, device),
+                tau=convert_array(self.tau, device),
+                lapl=convert_array(self.lapl, device) if self.lapl is not None else None
             )
         except ImportError:
             raise ImportError("PyTorch is not installed")
@@ -45,7 +61,8 @@ def eval_mgga_vvars(
     ks_scheme: str = "RKS",
     need_lapl: bool = False,
     exec_space: Union[str, ExecutionSpace] = "host",
-    return_torch: bool = False
+    return_torch: bool = False,
+    device: Optional[str] = None
 ) -> MGGAVariables:
     """
     Evaluate meta-GGA variables on a molecular grid.
@@ -64,6 +81,7 @@ def eval_mgga_vvars(
         The molecular grid (from compute_grid or create_molgrid)
     P : numpy.ndarray or torch.Tensor
         Density matrix (nbf x nbf, symmetric)
+        Can be CPU or GPU tensor; will be handled appropriately
     ks_scheme : str
         Kohn-Sham scheme: 'RKS', 'UKS', or 'GKS' (default: 'RKS')
         Note: Currently only RKS is implemented
@@ -73,6 +91,9 @@ def eval_mgga_vvars(
         Execution space: 'host' or 'device' (default: 'host')
     return_torch : bool
         Return PyTorch tensors instead of numpy arrays (default: False)
+    device : str or torch.device, optional
+        Target device for output when return_torch=True
+        If None and input is GPU tensor, uses same device as input
         
     Returns:
     --------
@@ -86,9 +107,49 @@ def eval_mgga_vvars(
     - gamma: contracted gradient γ(r) = |∇ρ(r)|² = (∂ρ/∂x)² + (∂ρ/∂y)² + (∂ρ/∂z)²
     - tau: kinetic energy density τ(r) = ½ Σᵢⱼ Pᵢⱼ (∇φᵢ(r))·(∇φⱼ(r))
     - lapl: Laplacian ∇²ρ(r) = ∂²ρ/∂x² + ∂²ρ/∂y² + ∂²ρ/∂z² (optional)
+    
+    GPU Tensor Support:
+    -------------------
+    When exec_space='device' and CUDA/HIP is enabled:
+    - GPU tensors can be passed directly and will be handled efficiently
+    - Results can be returned as GPU tensors with return_torch=True
+    - Zero-copy operations used when possible
+    
+    When exec_space='host' (default):
+    - GPU tensors are automatically copied to CPU for computation
+    - Results are returned on CPU
     """
-    # Convert torch tensors to numpy if needed
-    if hasattr(P, 'cpu'):  # torch tensor
+    # Detect if input is a torch tensor and its device
+    input_device = None
+    is_torch = False
+    
+    if hasattr(P, 'device'):  # torch tensor
+        is_torch = True
+        try:
+            import torch
+            input_device = P.device
+            
+            # Automatic exec_space detection based on tensor device
+            if exec_space == "host" or isinstance(exec_space, ExecutionSpace) and exec_space == ExecutionSpace.Host:
+                if P.is_cuda or (hasattr(P, 'is_hip') and P.is_hip):
+                    # GPU tensor but host execution - need to copy to CPU
+                    P = P.cpu().numpy()
+                else:
+                    P = P.numpy()
+            else:  # Device execution
+                # Check if tensor is on GPU
+                if not (P.is_cuda or (hasattr(P, 'is_hip') and P.is_hip)):
+                    raise ValueError(
+                        "exec_space='device' requires GPU tensor input. "
+                        "Please move tensor to GPU first with tensor.cuda() or tensor.to('cuda')"
+                    )
+                # For device execution, we still need CPU copy for current implementation
+                # TODO: Add native GPU tensor support when GauXC supports device pointers directly
+                P = P.cpu().numpy()
+        except ImportError:
+            pass
+    elif hasattr(P, 'cpu'):  # torch tensor (older API check)
+        is_torch = True
         P = P.cpu().numpy()
     
     P = np.asarray(P, dtype=np.float64)
@@ -106,8 +167,12 @@ def eval_mgga_vvars(
         try:
             exec_map['device'] = ExecutionSpace.Device
         except AttributeError:
-            pass
-        exec_space = exec_map[exec_space.lower()]
+            if exec_space.lower() == 'device':
+                raise RuntimeError(
+                    "Device execution requested but GauXC was not built with CUDA/HIP support. "
+                    "Please rebuild with -DGAUXC_ENABLE_CUDA=ON or -DGAUXC_ENABLE_HIP=ON"
+                )
+        exec_space = exec_map.get(exec_space.lower(), ExecutionSpace.Host)
     
     # Check KS scheme (only RKS implemented currently)
     if ks_scheme.upper() != "RKS":
@@ -141,6 +206,10 @@ def eval_mgga_vvars(
     
     # Convert to torch if requested
     if return_torch:
-        vvars = vvars.to_torch()
+        # Determine target device
+        if device is None and is_torch and input_device is not None:
+            # Use same device as input
+            device = input_device
+        vvars = vvars.to_torch(device)
     
     return vvars

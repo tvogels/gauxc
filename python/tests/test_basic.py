@@ -139,7 +139,75 @@ class TestTorchIntegration:
         
         mol = gxc.molecule_from_arrays(z_torch, coords_torch)
         assert mol.natoms() == 2
+    
+    @pytest.mark.skipif(not GAUXC_AVAILABLE, reason="GauXC not installed")
+    def test_gpu_tensor_handling(self):
+        try:
+            import torch
+        except ImportError:
+            pytest.skip("PyTorch not installed")
+        
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+        
+        # Create H2 molecule
+        z = np.array([1, 1], dtype=np.int32)
+        coords = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 1.4]], dtype=np.float64)
+        mol = gxc.molecule_from_arrays(z, coords)
+        
+        # Create minimal basis
+        basis = gxc.BasisSet()
+        alphas = np.array([3.4253, 0.6239, 0.1689], dtype=np.float64)
+        coeffs = np.array([0.1543, 0.5353, 0.4446], dtype=np.float64)
+        
+        for i in range(2):
+            shell = gxc.create_simple_shell(
+                1, 0, alphas, coeffs,
+                coords[i, 0], coords[i, 1], coords[i, 2]
+            )
+            basis.append(shell)
+        
+        # Generate grid
+        grid = gxc.compute_grid(
+            mol, basis,
+            pruning_scheme="robust",
+            batch_size=512,
+            grid_size="fine",
+            exec_space="host"
+        )
+        
+        # Create density matrix on GPU
+        nbf = basis.nbf()
+        P_cpu = torch.randn(nbf, nbf, dtype=torch.float64)
+        P_cpu = (P_cpu + P_cpu.T) / 2
+        P_gpu = P_cpu.cuda()
+        
+        # Test: GPU tensor with host execution should work
+        try:
+            vvars = gxc.eval_mgga_vvars(
+                mol, basis, grid, P_gpu,
+                exec_space="host",
+                return_torch=True
+            )
+            assert isinstance(vvars.rho, torch.Tensor)
+            assert vvars.rho.device.type == 'cpu'  # Should return on CPU
+        except Exception as e:
+            pytest.fail(f"GPU tensor with host execution failed: {e}")
+        
+        # Test: Can request output on GPU
+        try:
+            vvars_gpu = gxc.eval_mgga_vvars(
+                mol, basis, grid, P_cpu,
+                exec_space="host",
+                return_torch=True,
+                device='cuda'
+            )
+            assert isinstance(vvars_gpu.rho, torch.Tensor)
+            assert vvars_gpu.rho.device.type == 'cuda'
+        except Exception as e:
+            pytest.fail(f"Output to GPU failed: {e}")
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

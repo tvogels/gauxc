@@ -102,6 +102,8 @@ print(f"tau shape: {vvars.tau.shape}")      # (npts,)
 
 ## PyTorch Integration
 
+### Basic Usage
+
 ```python
 import torch
 import gauxc_py as gxc
@@ -131,6 +133,56 @@ vvars = gxc.eval_mgga_vvars(
 # Now vvars contains torch tensors
 assert isinstance(vvars.rho, torch.Tensor)
 ```
+
+### GPU Tensor Support (CUDA/HIP)
+
+When GauXC is built with CUDA or HIP support, GPU tensors are fully supported:
+
+```python
+import torch
+import gauxc_py as gxc
+
+# Move density matrix to GPU
+P_gpu = P_torch.cuda()
+
+# Option 1: Host execution (auto-copies GPU tensor to CPU)
+vvars_cpu = gxc.eval_mgga_vvars(
+    mol, basis, grid, P_gpu,
+    exec_space="host",
+    return_torch=True
+)
+# Output on CPU: vvars_cpu.rho.device = 'cpu'
+
+# Option 2: Device execution (requires CUDA/HIP build)
+vvars_gpu = gxc.eval_mgga_vvars(
+    mol, basis, grid, P_gpu,
+    exec_space="device",
+    return_torch=True,
+    device='cuda'  # Return results on GPU
+)
+# Output on GPU: vvars_gpu.rho.device = 'cuda:0'
+
+# Option 3: CPU input, GPU output
+vvars_to_gpu = gxc.eval_mgga_vvars(
+    mol, basis, grid, P_torch,  # CPU tensor
+    exec_space="host",
+    return_torch=True,
+    device='cuda:0'  # Move output to GPU
+)
+```
+
+**Behavior:**
+- **CPU tensors**: Work with any build (host or device execution)
+- **GPU tensors with `exec_space="host"`**: Auto-copied to CPU, computation on CPU
+- **GPU tensors with `exec_space="device"`**: Requires CUDA/HIP build, computation on GPU
+- **`device` parameter**: Controls output tensor placement when `return_torch=True`
+
+**Notes:**
+- Current implementation copies GPU tensors to CPU for computation
+- Zero-copy GPU operations planned for future release
+- Error messages guide users if CUDA/HIP build is required
+
+See `examples/gpu_tensor_example.py` for a complete demonstration.
 
 ## API Reference
 

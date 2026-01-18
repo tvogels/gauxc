@@ -22,13 +22,33 @@ class GridData:
     npts: int  # Total number of points
     molgrid: 'MolGrid' = None  # The underlying MolGrid object
     
-    def to_torch(self):
-        """Convert to PyTorch tensors (if available)."""
+    def to_torch(self, device=None):
+        """
+        Convert to PyTorch tensors (if available).
+        
+        Parameters:
+        -----------
+        device : str or torch.device, optional
+            Target device for tensors ('cpu', 'cuda', 'cuda:0', etc.)
+            If None, tensors remain on CPU
+        
+        Returns:
+        --------
+        GridData with PyTorch tensors
+        """
         try:
             import torch
+            
+            points_torch = torch.from_numpy(self.points)
+            weights_torch = torch.from_numpy(self.weights)
+            
+            if device is not None:
+                points_torch = points_torch.to(device)
+                weights_torch = weights_torch.to(device)
+            
             return GridData(
-                points=torch.from_numpy(self.points),
-                weights=torch.from_numpy(self.weights),
+                points=points_torch,
+                weights=weights_torch,
                 npts=self.npts,
                 molgrid=self.molgrid
             )
