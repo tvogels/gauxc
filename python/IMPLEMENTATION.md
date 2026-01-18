@@ -82,22 +82,43 @@ grid_data_torch = grid_data.to_torch()
 
 This avoids copying data and maintains interoperability.
 
-### 4. Meta-GGA Variables (Stub Implementation)
+### 4. Meta-GGA Variables (Fully Implemented)
 
-The `eval_mgga_vvars` function currently returns zeros as a placeholder. Full implementation requires:
+The `eval_mgga_vvars` function is now fully implemented using GauXC's collocation and density evaluation APIs:
 
-1. **Collocation Evaluation**: Call `LocalWorkDriver::eval_collocation*` methods to evaluate basis functions and derivatives on grid points
+**Implementation Details:**
 
-2. **Density Matrix Contraction**: Compute density variables from collocation and density matrix:
+1. **Collocation Evaluation**: Uses `LocalWorkDriver::eval_collocation_gradient` for basis functions φ(r) and derivatives ∇φ(r), or `eval_collocation_hessian` when Laplacian is needed
+
+2. **Density Matrix Contraction**: 
+   - Computes X matrix: `X = P * basis_eval` via `eval_xmat`
+   - Computes M matrices: `M_x/y/z = P * ∇_x/y/z basis_eval` for kinetic energy density
+   - Uses `eval_uvvar_mgga_rks` to compute final density variables
+
+3. **Variables Computed**:
    ```
-   rho(r) = sum_mu,nu P_mu,nu * phi_mu(r) * phi_nu(r)
-   grad_rho(r) = sum_mu,nu P_mu,nu * [grad_phi_mu(r) * phi_nu(r) + ...]
-   tau(r) = sum_mu,nu P_mu,nu * grad_phi_mu(r) · grad_phi_nu(r) / 2
+   ρ(r) = Σᵢⱼ Pᵢⱼ φᵢ(r) φⱼ(r)
+   ∇ρ(r) = 2·Σᵢⱼ Pᵢⱼ (∇φᵢ(r))φⱼ(r)  [RKS]
+   γ(r) = |∇ρ(r)|² = (∂ρ/∂x)² + (∂ρ/∂y)² + (∂ρ/∂z)²
+   τ(r) = ½ Σᵢⱼ Pᵢⱼ (∇φᵢ(r))·(∇φⱼ(r))
+   ∇²ρ(r) = Σᵢⱼ Pᵢⱼ [∇²φᵢ(r)φⱼ(r) + 2∇φᵢ·∇φⱼ + φᵢ∇²φⱼ] (optional)
    ```
 
-3. **Memory Management**: Allocate scratch space for collocation evaluation on each task
+4. **Memory Management**: Allocates scratch arrays for each task's collocation evaluation, automatically managing temporary storage
 
-The infrastructure is in place; the implementation requires exposing more of GauXC's internal collocation APIs.
+**Current Limitations:**
+- Only RKS (restricted Kohn-Sham) implemented; UKS and GKS require additional binding work
+- Single execution space per call (host or device)
+
+**Example Usage:**
+```python
+vvars = gxc.eval_mgga_vvars(mol, basis, grid, P, need_lapl=True)
+print(vvars.rho.shape)    # (npts,)
+print(vvars.grad.shape)   # (npts, 3)
+print(vvars.gamma.shape)  # (npts,)
+print(vvars.tau.shape)    # (npts,)
+print(vvars.lapl.shape)   # (npts,) if need_lapl=True
+```
 
 ## API Examples
 
