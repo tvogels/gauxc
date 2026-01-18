@@ -202,6 +202,7 @@ target_link_libraries( my_target PUBLIC gauxc::gauxc )
 | `GAUXC_ENABLE_HOST`        | Enable HOST integrators                                   | `ON`     |
 | `GAUXC_ENABLE_CUDA`        | Enable CUDA integrators                                   | `OFF`    |
 | `GAUXC_ENABLE_HIP`         | Enable HIP integrators                                    | `OFF`    |
+| `GAUXC_ENABLE_PYTHON`      | Enable Python bindings                                    | `OFF`    |
 | `GAUXC_ENABLE_MAGMA`       | Enable MAGMA for batched BLAS (No effect if no GPU)       | `ON`     |
 | `GAUXC_ENABLE_CUTLASS`     | Enable CUTLASS for batched BLAS (No effect if no CUDA)    | `OFF`    |
 | `GAUXC_ENABLE_NCCL`        | Enable NCCL bindings for topology aware GPU reductions    | `OFF`    |
@@ -217,6 +218,28 @@ target_link_libraries( my_target PUBLIC gauxc::gauxc )
 # Example Usage
 
 See `test/standalone_driver.cxx` for an example end-to-end invocation of GauXC for various integrands.
+
+# Python Bindings
+
+GauXC provides Python bindings with PyTorch integration. See `python/README.md` for details.
+
+**Quick install:**
+```bash
+pip install .
+```
+
+**Basic usage:**
+```python
+import gauxc_py as gxc
+import numpy as np
+
+# Create molecule, basis set, and grid
+mol = gxc.molecule_from_arrays(atomic_numbers, coords)
+grid = gxc.compute_grid(mol, basis, grid_size="ultrafine")
+
+# Evaluate meta-GGA variables
+vvars = gxc.eval_mgga_vvars(mol, basis, grid, density_matrix)
+```
 
 
 # License
