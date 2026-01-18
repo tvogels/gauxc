@@ -221,25 +221,54 @@ See `test/standalone_driver.cxx` for an example end-to-end invocation of GauXC f
 
 # Python Bindings
 
-GauXC provides Python bindings with PyTorch integration. See `python/README.md` for details.
+GauXC provides Python bindings with PyTorch integration for easy access to GPU-accelerated DFT grid generation and integration. The bindings expose:
 
-**Quick install:**
+- Molecule and basis set construction
+- Molecular grid generation with configurable parameters
+- Grid point and weight extraction
+- PyTorch tensor interoperability (zero-copy via DLPack)
+
+See `python/README.md` and `python/IMPLEMENTATION.md` for complete documentation.
+
+**Installation:**
 ```bash
+# From source with Python bindings enabled
+cmake -DGAUXC_ENABLE_PYTHON=ON <build options> <source_dir>
+cmake --build . -j
+pip install -e <source_dir>
+
+# Or directly with pip (requires dependencies)
 pip install .
 ```
 
-**Basic usage:**
+**Example usage:**
 ```python
 import gauxc_py as gxc
 import numpy as np
 
-# Create molecule, basis set, and grid
-mol = gxc.molecule_from_arrays(atomic_numbers, coords)
-grid = gxc.compute_grid(mol, basis, grid_size="ultrafine")
+# Create H2O molecule
+z = np.array([8, 1, 1])  # O, H, H
+coords = np.array([[0.0, 0.0, 0.1], [0.0, 0.8, -0.5], [0.0, -0.8, -0.5]])
+mol = gxc.molecule_from_arrays(z, coords)
 
-# Evaluate meta-GGA variables
-vvars = gxc.eval_mgga_vvars(mol, basis, grid, density_matrix)
+# Create basis set (simplified example)
+basis = gxc.BasisSet()
+# ... add shells to basis ...
+
+# Generate high-quality molecular grid
+grid = gxc.compute_grid(
+    mol, basis,
+    pruning_scheme="robust",
+    grid_size="ultrafine",
+    batch_size=512
+)
+
+print(f"Generated grid with {grid.npts} points")
+# grid.points: (npts, 3) array of coordinates
+# grid.weights: (npts,) array of quadrature weights
 ```
+
+**Note:** Meta-GGA variable evaluation is currently a stub and requires additional implementation. See `python/IMPLEMENTATION.md` for details on completing this functionality.
 
 
 # License
