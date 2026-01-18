@@ -116,11 +116,19 @@ void bind_grid(py::module& m) {
         [](const Molecule& mol, const MolGrid& molgrid, 
            const BasisSet<double>& basis, ExecutionSpace exec_space) {
             
-            // Create runtime environment (no MPI for simplicity)
+            // Create runtime environment
+            #ifdef GAUXC_HAS_MPI
+            #ifdef GAUXC_HAS_DEVICE
+            RuntimeEnvironment rt = DeviceRuntimeEnvironment(MPI_COMM_SELF, 0.9);
+            #else
+            RuntimeEnvironment rt = RuntimeEnvironment(MPI_COMM_SELF);
+            #endif
+            #else
             #ifdef GAUXC_HAS_DEVICE
             RuntimeEnvironment rt = DeviceRuntimeEnvironment(0.9);
             #else
             RuntimeEnvironment rt = RuntimeEnvironment();
+            #endif
             #endif
             
             // Create load balancer

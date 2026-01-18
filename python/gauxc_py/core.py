@@ -34,14 +34,12 @@ __all__ = [
     'Grid',
     'MolGrid',
     'LoadBalancer',
-    'IntegratorSettingsXC',
-    'IntegratorSettingsEXX',
     'create_molecule',
     'get_molecule_coords',
     'create_simple_shell',
     'create_molgrid',
     'extract_grid_data',
-    'eval_mgga_vvars',
+    'eval_mgga_vvars_stub',
     'supports_torch',
 ]
 

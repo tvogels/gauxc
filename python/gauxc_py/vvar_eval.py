@@ -8,7 +8,7 @@ import numpy as np
 
 from .core import (
     Molecule, BasisSet, MolGrid, ExecutionSpace,
-    eval_mgga_vvars as _eval_mgga_vvars
+    eval_mgga_vvars_stub
 )
 from .grid_utils import GridData
 
@@ -40,7 +40,7 @@ class MGGAVariables:
 def eval_mgga_vvars(
     mol: Molecule,
     basis: BasisSet,
-    grid: Union[GridData, MolGrid],
+    grid: GridData,
     P: np.ndarray,
     ks_scheme: str = "RKS",
     need_lapl: bool = False,
@@ -50,13 +50,17 @@ def eval_mgga_vvars(
     """
     Evaluate meta-GGA variables on a molecular grid.
     
+    NOTE: This is currently a stub implementation that returns zero arrays.
+    Full implementation requires deeper integration with GauXC collocation
+    and density evaluation kernels.
+    
     Parameters:
     -----------
     mol : Molecule
         The molecule
     basis : BasisSet
         The basis set
-    grid : GridData or MolGrid
+    grid : GridData
         The molecular grid (from compute_grid)
     P : numpy.ndarray or torch.Tensor
         Density matrix (nbf x nbf)
@@ -93,32 +97,8 @@ def eval_mgga_vvars(
     if P.shape != (nbf, nbf):
         raise ValueError(f"Density matrix shape {P.shape} doesn't match basis size {nbf}x{nbf}")
     
-    # Convert exec_space string to enum
-    if isinstance(exec_space, str):
-        exec_map = {
-            'host': ExecutionSpace.Host,
-        }
-        try:
-            exec_map['device'] = ExecutionSpace.Device
-        except AttributeError:
-            pass
-        exec_space = exec_map[exec_space.lower()]
-    
-    # If grid is GridData, we need to create MolGrid
-    # For now, assume it's already a MolGrid from compute_grid internals
-    if isinstance(grid, GridData):
-        raise NotImplementedError(
-            "Direct GridData input not yet supported. "
-            "Pass the MolGrid object instead, or use compute_grid first."
-        )
-    
-    # Call C++ binding
-    result = _eval_mgga_vvars(
-        mol, basis, grid, P,
-        ks_scheme=ks_scheme.upper(),
-        need_lapl=need_lapl,
-        exec_space=exec_space
-    )
+    # Call C++ stub (returns zeros for now)
+    result = eval_mgga_vvars_stub(grid.points, P)
     
     # Create MGGAVariables object
     vvars = MGGAVariables(
