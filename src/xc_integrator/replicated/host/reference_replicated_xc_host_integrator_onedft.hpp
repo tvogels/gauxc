@@ -21,10 +21,11 @@ namespace detail {
   
 FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, const Molecule& mol, 
   const std::vector<std::string> feature_keys, const RuntimeEnvironment& rt, std::vector<int>& sendcounts, 
-  std::vector<int>& displs);
+  std::vector<int>& displs, std::vector<int64_t>& atom_reorder_inv_perm);
 
 void send_buffer_onedft_outputs(const int ndm, const FeatureDict features_dict, std::vector<XCTask>& tasks, 
-  const RuntimeEnvironment& rt, std::vector<int> sendcounts, std::vector<int> displs);
+  const RuntimeEnvironment& rt, std::vector<int> sendcounts, std::vector<int> displs,
+  const std::vector<int64_t>& atom_reorder_inv_perm);
 
 void interleave_data(const double* a, const double* b, const size_t n, double* out);
 
@@ -118,8 +119,9 @@ void ReferenceReplicatedXCHostIntegrator<ValueType>::
   });
   std::vector<int> sendcounts(rt.comm_size(), 0);
   std::vector<int> displs(rt.comm_size(), 0);
+  std::vector<int64_t> atom_reorder_inv_perm;
   FeatureDict features_dict = prepare_onedft_features(2/*ndm*/, tasks, this->load_balancer_->molecule(), feature_keys, rt, 
-    sendcounts, displs);
+    sendcounts, displs, atom_reorder_inv_perm);
   if (world_rank == 0) {
     auto exc_on_grid = get_exc(exc_func, features_dict);
     // check is_nan
@@ -133,7 +135,7 @@ void ReferenceReplicatedXCHostIntegrator<ValueType>::
   // MPI_Bcast(EXC, 1, MPI_DOUBLE, 0, rt.comm());
   // TODO: stop here if only exc
 
-  send_buffer_onedft_outputs(2/*ndm*/, features_dict, tasks, rt, sendcounts, displs);
+  send_buffer_onedft_outputs(2/*ndm*/, features_dict, tasks, rt, sendcounts, displs, atom_reorder_inv_perm);
 
   this->timer_.time_op("XCIntegrator.LocalWork2", [&](){
     post_onedft_local_work_( basis, Ps, ldps, Pz, ldpz, VXCs, n, VXCz, n, is_gga, is_mgga, false /*needs_laplacian*/);
@@ -671,7 +673,8 @@ void interleave_data(const double* a, const double* b, const size_t n, double* r
 
 FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, const Molecule& mol, 
                   const std::vector<std::string> feature_keys, const RuntimeEnvironment& rt,
-                  std::vector<int>& sendcounts, std::vector<int>& displs) {
+                  std::vector<int>& sendcounts, std::vector<int>& displs,
+                  std::vector<int64_t>& atom_reorder_inv_perm) {
   std::vector<double> den_eval, dden_eval, tau, grid_coords, grid_weights;
   int total_npts = std::accumulate( tasks.begin(), tasks.end(), 0,
     [](const auto& a, const auto& b) { return a + b.npts; } );
@@ -717,16 +720,27 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
     }
   }
 
-  // For MPI: reduce per-atom sizes across ranks to get global totals
-  // TODO: For MPI with non-local models, the gathered flat data is rank-ordered,
-  //       not atom-ordered. pack_features/pad_ragged in the model expects atom-ordered
-  //       data. A reordering pass on rank 0 would be needed for full MPI support.
+  // For MPI: gather per-rank per-atom sizes to rank 0 so we can build a
+  // permutation that reorders the gathered flat data from rank-order to atom-order.
+  std::vector<int64_t> all_rank_atom_sizes;     // [world_size * natoms] on rank 0
   std::vector<int64_t> global_atomic_grid_sizes_vec = atomic_grid_sizes_vec;
+  std::vector<int64_t> atom_reorder_perm;
+  std::vector<int64_t> atom_reorder_inv_perm_local;
   GAUXC_MPI_CODE(
     if (rt.comm_size() > 1) {
-      global_atomic_grid_sizes_vec.assign(natoms, 0);
-      MPI_Reduce(atomic_grid_sizes_vec.data(), global_atomic_grid_sizes_vec.data(), natoms,
-                 MPI_INT64_T, MPI_SUM, 0, rt.comm());
+      int world_size = rt.comm_size();
+      int world_rank_local = rt.comm_rank();
+      all_rank_atom_sizes.resize(world_rank_local == 0 ? world_size * natoms : 0);
+      MPI_Gather(atomic_grid_sizes_vec.data(), natoms, MPI_INT64_T,
+                 all_rank_atom_sizes.data(), natoms, MPI_INT64_T,
+                 0, rt.comm());
+      // Compute global sizes by summing across ranks (on rank 0)
+      if (world_rank_local == 0) {
+        global_atomic_grid_sizes_vec.assign(natoms, 0);
+        for (int r = 0; r < world_size; ++r)
+          for (int a = 0; a < natoms; ++a)
+            global_atomic_grid_sizes_vec[a] += all_rank_atom_sizes[r * natoms + a];
+      }
     }
   );
   
@@ -734,7 +748,30 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
   GAUXC_MPI_CODE(
     total_npts = mpi_gather_onedft_inputs(den_eval, dden_eval, tau, grid_coords, grid_weights, total_npts, 
       world_rank, rt.comm_size(), sendcounts, displs);
+
+    // Reorder gathered flat arrays from rank-order to atom-order on rank 0
+    if (rt.comm_size() > 1 && world_rank == 0) {
+      auto [perm, inv_perm] = build_atom_reorder_perm(
+        all_rank_atom_sizes, sendcounts, displs, natoms, rt.comm_size());
+      atom_reorder_perm = std::move(perm);
+      atom_reorder_inv_perm_local = std::move(inv_perm);
+
+      auto reorder = [&](std::vector<double>& vec, int stride) {
+        if (vec.empty()) return;
+        std::vector<double> tmp(vec.size());
+        apply_strided_permutation(vec.data(), tmp.data(),
+                                  atom_reorder_perm, total_npts, stride);
+        vec = std::move(tmp);
+      };
+      reorder(grid_weights, 1);
+      reorder(den_eval, 2);    // interleaved [alpha, beta] per point
+      reorder(grid_coords, 3); // interleaved [x, y, z] per point
+      reorder(dden_eval, 6);   // [dXa, dYa, dZa, dXb, dYb, dZb] per point
+      reorder(tau, 2);         // interleaved [alpha, beta] per point
+    }
   );
+  // Export the inverse permutation for the scatter path
+  atom_reorder_inv_perm = std::move(atom_reorder_inv_perm_local);
   FeatureDict featmap;
   if (world_rank == 0) {
     int64_t max_grid_size = *std::max_element(
@@ -808,11 +845,13 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
 }
 
 void send_buffer_onedft_outputs(const int ndm, const FeatureDict features_dict, std::vector<XCTask>& tasks, 
-                                const RuntimeEnvironment& rt, std::vector<int> sendcounts, std::vector<int> displs) {
+                                const RuntimeEnvironment& rt, std::vector<int> sendcounts, std::vector<int> displs,
+                                const std::vector<int64_t>& atom_reorder_inv_perm) {
 
   std::vector<double> den_eval, dden_eval, tau;
   auto total_npts = mpi_scatter_onedft_outputs(features_dict, rt.comm_rank(), rt.comm_size(),
-                                                sendcounts, displs, den_eval, dden_eval, tau);
+                                                sendcounts, displs, atom_reorder_inv_perm,
+                                                den_eval, dden_eval, tau);
 
   size_t offset = 0;
   for (auto&task : tasks) {

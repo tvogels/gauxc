@@ -107,6 +107,7 @@ get_exc(torch::jit::Method exc_func, FeatureDict features) {
 int mpi_scatter_onedft_outputs(const FeatureDict features_dict, // only exist in rank 0
                           const int world_rank, const int world_size,
                           std::vector<int> recvcounts, std::vector<int> displs,
+                          const std::vector<int64_t>& atom_reorder_inv_perm,
                           std::vector<double>& den_eval, std::vector<double>& dden_eval, std::vector<double>& tau) {
   // store data
   std::vector<double> recv_den_eval, recv_dden_eval, recv_tau;
@@ -161,6 +162,31 @@ int mpi_scatter_onedft_outputs(const FeatureDict features_dict, // only exist in
       at::Tensor tau_grad_tensor = features_dict.at(feat_map.at(ONEDFT_FEATURE::TAU)).grad().cpu().contiguous();
       std::memcpy(recv_tau_a, tau_grad_tensor.data_ptr<double>(), total_npts * sizeof(double));
       std::memcpy(recv_tau_b, tau_grad_tensor.data_ptr<double>() + total_npts, total_npts * sizeof(double));
+    }
+  }
+
+  // Apply inverse atom-reorder: convert atom-ordered gradients back to rank-ordered
+  // so each rank receives the correct values after Scatterv.
+  // Each channel is a contiguous block of total_npts values (stride 1).
+  if (world_rank == 0 && !atom_reorder_inv_perm.empty()) {
+    auto inv_reorder_channel = [&](double* channel) {
+      std::vector<double> tmp(total_npts);
+      apply_strided_permutation(channel, tmp.data(), atom_reorder_inv_perm, total_npts, 1);
+      std::memcpy(channel, tmp.data(), total_npts * sizeof(double));
+    };
+    inv_reorder_channel(recv_den_eval_a);
+    inv_reorder_channel(recv_den_eval_b);
+    if (is_gga || is_mgga) {
+      inv_reorder_channel(recv_dden_x_eval_a);
+      inv_reorder_channel(recv_dden_y_eval_a);
+      inv_reorder_channel(recv_dden_z_eval_a);
+      inv_reorder_channel(recv_dden_x_eval_b);
+      inv_reorder_channel(recv_dden_y_eval_b);
+      inv_reorder_channel(recv_dden_z_eval_b);
+    }
+    if (is_mgga) {
+      inv_reorder_channel(recv_tau_a);
+      inv_reorder_channel(recv_tau_b);
     }
   }
   
@@ -396,5 +422,68 @@ int mpi_gather_onedft_inputs(std::vector<double>& den_eval, std::vector<double>&
 #endif
 }
 
+std::pair<std::vector<int64_t>, std::vector<int64_t>>
+build_atom_reorder_perm(const std::vector<int64_t>& all_rank_atom_sizes,
+                        const std::vector<int>& sendcounts,
+                        const std::vector<int>& displs,
+                        int natoms, int world_size) {
+  int64_t total_npts = 0;
+  for (int r = 0; r < world_size; ++r) total_npts += sendcounts[r];
+
+  std::vector<int64_t> perm(total_npts);
+  std::vector<int64_t> inv_perm(total_npts);
+
+  // Precompute per-rank per-atom offsets within each rank's chunk
+  // src_off[r][a] = displs[r] + sum of all_rank_atom_sizes[r*natoms + a'] for a' < a
+  std::vector<std::vector<int64_t>> src_off(world_size, std::vector<int64_t>(natoms));
+  for (int r = 0; r < world_size; ++r) {
+    int64_t off = displs[r];
+    for (int a = 0; a < natoms; ++a) {
+      src_off[r][a] = off;
+      off += all_rank_atom_sizes[r * natoms + a];
+    }
+  }
+
+  // Precompute global atom offsets (destination start for each atom)
+  std::vector<int64_t> global_atom_off(natoms);
+  {
+    int64_t off = 0;
+    for (int a = 0; a < natoms; ++a) {
+      global_atom_off[a] = off;
+      for (int r = 0; r < world_size; ++r)
+        off += all_rank_atom_sizes[r * natoms + a];
+    }
+  }
+
+  // Build perm: for each atom, concatenate contributions from all ranks in rank order
+  // dst_cursor tracks the next write position for each atom
+  std::vector<int64_t> dst_cursor = global_atom_off;
+  for (int a = 0; a < natoms; ++a) {
+    for (int r = 0; r < world_size; ++r) {
+      int64_t count = all_rank_atom_sizes[r * natoms + a];
+      int64_t src = src_off[r][a];
+      for (int64_t k = 0; k < count; ++k) {
+        perm[src + k] = dst_cursor[a] + k;
+      }
+      dst_cursor[a] += count;
+    }
+  }
+
+  // Build inverse: inv_perm[perm[i]] = i
+  for (int64_t i = 0; i < total_npts; ++i) {
+    inv_perm[perm[i]] = i;
+  }
+
+  return {std::move(perm), std::move(inv_perm)};
+}
+
+void apply_strided_permutation(const double* src, double* dst,
+                               const std::vector<int64_t>& perm,
+                               int64_t npts, int stride) {
+  for (int64_t i = 0; i < npts; ++i) {
+    int64_t j = perm[i];
+    std::copy(src + i * stride, src + (i + 1) * stride, dst + j * stride);
+  }
+}
 
 } // namespace GauXC

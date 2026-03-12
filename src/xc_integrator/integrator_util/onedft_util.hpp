@@ -49,6 +49,7 @@ namespace GauXC {
 int mpi_scatter_onedft_outputs(const FeatureDict features_dict,
                           const int world_rank, const int world_size,
                           std::vector<int> recvcounts, std::vector<int> displs,
+                          const std::vector<int64_t>& atom_reorder_inv_perm,
                           std::vector<double>& den_eval, std::vector<double>& dden_eval, 
                           std::vector<double>& tau);
 
@@ -70,4 +71,21 @@ int mpi_gather_onedft_inputs_gpu(std::vector<double>& den_eval, std::vector<doub
 
   at::Tensor
     get_exc(torch::jit::Method exc_func, FeatureDict features);
+
+  // Build a permutation that reorders gathered MPI data from rank-order to atom-order.
+  // all_rank_atom_sizes: [world_size * natoms], row-major (rank-major).
+  // sendcounts/displs: per-rank point counts and displacements from MPI_Gatherv.
+  // Returns (perm, inv_perm) where perm[rank_ordered_idx] = atom_ordered_idx.
+  std::pair<std::vector<int64_t>, std::vector<int64_t>>
+    build_atom_reorder_perm(const std::vector<int64_t>& all_rank_atom_sizes,
+                            const std::vector<int>& sendcounts,
+                            const std::vector<int>& displs,
+                            int natoms, int world_size);
+
+  // Apply a point-level permutation to a strided array.
+  // For each point i, copies stride elements from src[perm[i]*stride .. +stride)
+  // to dst[i*stride .. +stride).
+  void apply_strided_permutation(const double* src, double* dst,
+                                 const std::vector<int64_t>& perm,
+                                 int64_t npts, int stride);
 } // namespace GauXC

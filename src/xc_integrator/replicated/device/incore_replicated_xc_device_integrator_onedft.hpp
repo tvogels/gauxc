@@ -238,8 +238,11 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
     device_data_ptr->send_static_data_onedft_results( total_npts, ndm, EXC,
       den_grad, dden_grad, tau_grad );
   } else { 
+    // GPU MPI path: atom reorder not yet implemented (empty inv_perm = no-op)
+    std::vector<int64_t> empty_inv_perm;
     total_npts = mpi_scatter_onedft_outputs(features_dict, rt.comm_rank(), rt.comm_size(),
-                                              recvcounts, displs, den_eval, dden_eval, tau);
+                                              recvcounts, displs, empty_inv_perm,
+                                              den_eval, dden_eval, tau);
     device_data_ptr->send_static_data_onedft_results( total_npts, ndm, EXC,
       den_eval.data(), dden_eval.data(), tau.data());
   }
