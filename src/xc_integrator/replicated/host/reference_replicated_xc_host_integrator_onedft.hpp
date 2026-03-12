@@ -707,6 +707,28 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
     offset += task.points.size();
     std::copy(task.feat.tau.begin(), task.feat.tau.end(), std::back_inserter(tau));
   }
+
+  // Compute per-atom grid sizes from local tasks (tasks are sorted by iParent)
+  int natoms = mol.size();
+  std::vector<int64_t> atomic_grid_sizes_vec(natoms, 0);
+  for (const auto& task : tasks) {
+    if (task.iParent >= 0 && task.iParent < natoms) {
+      atomic_grid_sizes_vec[task.iParent] += task.npts;
+    }
+  }
+
+  // For MPI: reduce per-atom sizes across ranks to get global totals
+  // TODO: For MPI with non-local models, the gathered flat data is rank-ordered,
+  //       not atom-ordered. pack_features/pad_ragged in the model expects atom-ordered
+  //       data. A reordering pass on rank 0 would be needed for full MPI support.
+  std::vector<int64_t> global_atomic_grid_sizes_vec = atomic_grid_sizes_vec;
+  GAUXC_MPI_CODE(
+    if (rt.comm_size() > 1) {
+      global_atomic_grid_sizes_vec.assign(natoms, 0);
+      MPI_Reduce(atomic_grid_sizes_vec.data(), global_atomic_grid_sizes_vec.data(), natoms,
+                 MPI_INT64_T, MPI_SUM, 0, rt.comm());
+    }
+  );
   
   int world_rank = rt.comm_rank();  
   GAUXC_MPI_CODE(
@@ -715,7 +737,8 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
   );
   FeatureDict featmap;
   if (world_rank == 0) {
-    int natoms = mol.size();
+    int64_t max_grid_size = *std::max_element(
+      global_atomic_grid_sizes_vec.begin(), global_atomic_grid_sizes_vec.end());
     std::vector<double> coarse_0_atomic_coords (natoms*3); 
     for (int i = 0; i < natoms; i++) {
       coarse_0_atomic_coords[3*i] = mol[i].x;
@@ -756,6 +779,20 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
       case ONEDFT_FEATURE::COORDS: {
         auto flat_tensor = torch::from_blob(coarse_0_atomic_coords.data(), {natoms, 3}, options);
         tensor = flat_tensor.clone();
+        break;
+      }
+      case ONEDFT_FEATURE::ATOMIC_GRID_WEIGHTS: {
+        auto flat_tensor = torch::from_blob(grid_weights.data(), {total_npts}, options);
+        tensor = flat_tensor.clone();
+        break;
+      }
+      case ONEDFT_FEATURE::ATOMIC_GRID_SIZES: {
+        auto sizes_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        tensor = torch::from_blob(global_atomic_grid_sizes_vec.data(), {natoms}, sizes_options).clone();
+        break;
+      }
+      case ONEDFT_FEATURE::ATOMIC_GRID_SIZE_BOUND_SHAPE: {
+        tensor = torch::zeros({max_grid_size}, options);
         break;
       }
       default:

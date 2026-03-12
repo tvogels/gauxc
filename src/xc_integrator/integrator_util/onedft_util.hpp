@@ -19,7 +19,7 @@ namespace GauXC {
   // TODO add laplacian ?
   void print_memory_stats(size_t device_id);
   
-  enum ONEDFT_FEATURE { DEN, DDEN, TAU, POINTS, WEIGHTS, COORDS };
+  enum ONEDFT_FEATURE { DEN, DDEN, TAU, POINTS, WEIGHTS, COORDS, ATOMIC_GRID_WEIGHTS, ATOMIC_GRID_SIZES, ATOMIC_GRID_SIZE_BOUND_SHAPE };
 
   // Mapping enums to string values
   inline const std::map<ONEDFT_FEATURE, std::string> feat_map = {
@@ -28,7 +28,10 @@ namespace GauXC {
     {TAU, "kin"},
     {POINTS, "grid_coords"},
     {WEIGHTS, "grid_weights"},
-    {COORDS, "coarse_0_atomic_coords"}
+    {COORDS, "coarse_0_atomic_coords"},
+    {ATOMIC_GRID_WEIGHTS, "atomic_grid_weights"},
+    {ATOMIC_GRID_SIZES, "atomic_grid_sizes"},
+    {ATOMIC_GRID_SIZE_BOUND_SHAPE, "atomic_grid_size_bound_shape"}
   };
 
   inline const std::map<std::string, ONEDFT_FEATURE> reverse_feat_map = {
@@ -37,7 +40,10 @@ namespace GauXC {
     {"kin", TAU},
     {"grid_coords", POINTS},
     {"grid_weights", WEIGHTS},
-    {"coarse_0_atomic_coords", COORDS}
+    {"coarse_0_atomic_coords", COORDS},
+    {"atomic_grid_weights", ATOMIC_GRID_WEIGHTS},
+    {"atomic_grid_sizes", ATOMIC_GRID_SIZES},
+    {"atomic_grid_size_bound_shape", ATOMIC_GRID_SIZE_BOUND_SHAPE}
   };
   
 int mpi_scatter_onedft_outputs(const FeatureDict features_dict,

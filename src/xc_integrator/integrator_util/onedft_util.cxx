@@ -50,6 +50,12 @@ std::string map_model(const std::string& model, torch::DeviceType device) {
         return model_path + "/tpss.fun";
     } else if (model == "LDA") {
         return model_path + "/lda.fun";
+    } else if (model == "SKALA-v1.0") {
+        return model_path + "/skala-v1.0.fun";
+    } else if (model == "SKALA-v1.1") {
+        return model_path + "/skala-v1.1.fun";
+    } else if (model == "SKALA") {
+        GAUXC_GENERIC_EXCEPTION("SKALA is deprecated, use SKALA-v1.0 or SKALA-v1.1");
     } else {
         GAUXC_GENERIC_EXCEPTION("Model " + model + " not found in " + model_path);
     }
