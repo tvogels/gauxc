@@ -138,4 +138,31 @@ int mpi_gather_onedft_inputs_gpu(std::vector<double>& den_eval, std::vector<doub
       const std::vector<int64_t>& inv_perm,
       int64_t total_npts,
       bool is_gga, bool is_mgga);
+
+  // Forward (channel-first): reorder GPU-layout flat arrays from rank-order to atom-order.
+  // GPU data uses channel-first layout for den/dden/tau (each channel has npts contiguous
+  // values), but stride 3 for grid_coords and stride 1 for grid_weights.
+  void reorder_to_atom_order_channel_first(
+      std::vector<double>& grid_weights,
+      std::vector<double>& den_eval,
+      std::vector<double>& grid_coords,
+      std::vector<double>& dden_eval,
+      std::vector<double>& tau,
+      const std::vector<int64_t>& perm,
+      int64_t total_npts,
+      bool is_gga, bool is_mgga);
+
+  // GPU variant of mpi_gather_and_reorder: gathers GPU-layout (channel-first) data,
+  // builds atom-order permutation, and reorders to atom-order on rank 0.
+  AtomReorderResult mpi_gather_and_reorder_gpu(
+      std::vector<double>& den_eval,
+      std::vector<double>& dden_eval,
+      std::vector<double>& tau,
+      std::vector<double>& grid_coords,
+      std::vector<double>& grid_weights,
+      const std::vector<int64_t>& local_atomic_grid_sizes,
+      int total_npts, int natoms,
+      const RuntimeEnvironment& rt,
+      std::vector<int>& sendcounts,
+      std::vector<int>& displs);
 } // namespace GauXC

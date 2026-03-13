@@ -572,4 +572,102 @@ void reorder_to_rank_order(
   }
 }
 
+void reorder_to_atom_order_channel_first(
+    std::vector<double>& grid_weights,
+    std::vector<double>& den_eval,
+    std::vector<double>& grid_coords,
+    std::vector<double>& dden_eval,
+    std::vector<double>& tau,
+    const std::vector<int64_t>& perm,
+    int64_t total_npts,
+    bool is_gga, bool is_mgga) {
+  // Helper: permute a single channel (stride 1) in-place via temp buffer
+  auto permute_channel = [&](double* channel) {
+    std::vector<double> tmp(total_npts);
+    apply_strided_permutation(channel, tmp.data(), perm, total_npts, 1);
+    std::memcpy(channel, tmp.data(), total_npts * sizeof(double));
+  };
+
+  // grid_weights: stride 1 (single channel)
+  if (!grid_weights.empty()) {
+    std::vector<double> tmp(grid_weights.size());
+    apply_strided_permutation(grid_weights.data(), tmp.data(), perm, total_npts, 1);
+    grid_weights = std::move(tmp);
+  }
+  // grid_coords: stride 3 (interleaved per point)
+  if (!grid_coords.empty()) {
+    std::vector<double> tmp(grid_coords.size());
+    apply_strided_permutation(grid_coords.data(), tmp.data(), perm, total_npts, 3);
+    grid_coords = std::move(tmp);
+  }
+  // den_eval: channel-first [alpha(npts) | beta(npts)]
+  if (!den_eval.empty()) {
+    permute_channel(den_eval.data());
+    permute_channel(den_eval.data() + total_npts);
+  }
+  // dden_eval: channel-first [dXa(npts) | dYa | dZa | dXb | dYb | dZb]
+  if ((is_gga || is_mgga) && !dden_eval.empty()) {
+    for (int c = 0; c < 6; ++c)
+      permute_channel(dden_eval.data() + c * total_npts);
+  }
+  // tau: channel-first [alpha(npts) | beta(npts)]
+  if (is_mgga && !tau.empty()) {
+    permute_channel(tau.data());
+    permute_channel(tau.data() + total_npts);
+  }
+}
+
+AtomReorderResult mpi_gather_and_reorder_gpu(
+    std::vector<double>& den_eval,
+    std::vector<double>& dden_eval,
+    std::vector<double>& tau,
+    std::vector<double>& grid_coords,
+    std::vector<double>& grid_weights,
+    const std::vector<int64_t>& local_atomic_grid_sizes,
+    int total_npts, int natoms,
+    const RuntimeEnvironment& rt,
+    std::vector<int>& sendcounts,
+    std::vector<int>& displs) {
+
+  AtomReorderResult result;
+  result.global_atomic_grid_sizes = local_atomic_grid_sizes;
+  int world_rank = rt.comm_rank();
+
+  bool is_gga = !dden_eval.empty();
+  bool is_mgga = !tau.empty();
+
+  GAUXC_MPI_CODE(
+    total_npts = mpi_gather_onedft_inputs_gpu(den_eval, dden_eval, tau, grid_coords,
+      grid_weights, total_npts, world_rank, rt.comm_size(), sendcounts, displs);
+  );
+
+  GAUXC_MPI_CODE(
+    if (rt.comm_size() > 1) {
+      int world_size = rt.comm_size();
+
+      std::vector<int64_t> all_rank_atom_sizes(world_rank == 0 ? world_size * natoms : 0);
+      MPI_Gather(local_atomic_grid_sizes.data(), natoms, MPI_INT64_T,
+                 all_rank_atom_sizes.data(), natoms, MPI_INT64_T,
+                 0, rt.comm());
+
+      if (world_rank == 0) {
+        result.global_atomic_grid_sizes.assign(natoms, 0);
+        for (int r = 0; r < world_size; ++r)
+          for (int a = 0; a < natoms; ++a)
+            result.global_atomic_grid_sizes[a] += all_rank_atom_sizes[r * natoms + a];
+
+        auto [perm, inv_perm] = build_atom_reorder_perm(
+          all_rank_atom_sizes, sendcounts, displs, natoms, world_size);
+        reorder_to_atom_order_channel_first(grid_weights, den_eval, grid_coords,
+                                            dden_eval, tau, perm, total_npts,
+                                            is_gga, is_mgga);
+        result.inv_perm = std::move(inv_perm);
+      }
+    }
+  );
+
+  result.total_npts = total_npts;
+  return result;
+}
+
 } // namespace GauXC

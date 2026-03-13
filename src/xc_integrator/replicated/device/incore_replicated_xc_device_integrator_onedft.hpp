@@ -21,7 +21,9 @@ namespace GauXC::detail {
 FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npts, const size_t ndm,
   const at::TensorOptions options, const std::vector<std::string> feature_keys,
   double* den_eval, double* dden_eval, double* tau, double* grid_coords, 
-  double* grid_weights, double* coords );
+  double* grid_weights, double* coords,
+  const std::vector<int64_t>& atomic_grid_sizes = {},
+  int64_t max_grid_size = 0 );
 
 size_t save_static_data_onedft_features (XCDeviceData* _data, const integrator_term_tracker enabled_terms, size_t offset);
 
@@ -168,18 +170,31 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
   std::vector<double> grid_weights, grid_coords, den_eval, dden_eval, tau;
   std::vector<int> displs(world_size), recvcounts(world_size);
 
-  // run onedft model on thread 0
+  // Compute per-atom grid sizes from tasks
+  std::vector<int64_t> atomic_grid_sizes_vec(natoms, 0);
+  for (const auto& task : tasks) {
+    if (task.iParent >= 0 && task.iParent < (int)natoms) {
+      atomic_grid_sizes_vec[task.iParent] += task.npts;
+    }
+  }
+
+  // run onedft model on rank 0
   FeatureDict features_dict;
+  std::vector<int64_t> atom_reorder_inv_perm;
+  std::vector<int64_t> global_atomic_grid_sizes_vec = atomic_grid_sizes_vec;
 
   if ( world_size == 1 ) { // keep everything on device
+    int64_t max_grid_size = *std::max_element(
+      atomic_grid_sizes_vec.begin(), atomic_grid_sizes_vec.end());
     auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCUDA);
     features_dict = prepare_onedft_features(
       natoms, total_npts, ndm, options, feature_keys, device_data_ptr->den_eval_device_data(),
       device_data_ptr->dden_eval_device_data(), device_data_ptr->tau_device_data(),
       device_data_ptr->grid_coords_device_data(), device_data_ptr->grid_weights_device_data(),
-      device_data_ptr->coords_device_data()
+      device_data_ptr->coords_device_data(),
+      atomic_grid_sizes_vec, max_grid_size
     );
-  } else { // copy to host and then back to device
+  } else { // copy to host, gather, reorder, then back to device
     grid_weights.resize(total_npts);
     grid_coords.resize(total_npts * 3);
     den_eval.resize(total_npts * ndm);
@@ -201,14 +216,22 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
       host_coords[3*i+2] = mol[i].z;
     }
 
-    int total_npts_sum = mpi_gather_onedft_inputs_gpu(den_eval, dden_eval, tau, grid_coords, grid_weights,
-      total_npts, world_rank, world_size, recvcounts, displs);
+    auto reorder_result = mpi_gather_and_reorder_gpu(
+      den_eval, dden_eval, tau, grid_coords, grid_weights,
+      atomic_grid_sizes_vec, total_npts, natoms, rt, recvcounts, displs);
+    int total_npts_sum = reorder_result.total_npts;
+    atom_reorder_inv_perm = std::move(reorder_result.inv_perm);
+    global_atomic_grid_sizes_vec = std::move(reorder_result.global_atomic_grid_sizes);
+
     if (world_rank == 0) {
+      int64_t max_grid_size = *std::max_element(
+        global_atomic_grid_sizes_vec.begin(), global_atomic_grid_sizes_vec.end());
       auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
       features_dict = prepare_onedft_features(
         natoms, total_npts_sum, ndm, options, feature_keys, den_eval.data(),
         dden_eval.data(), tau.data(), grid_coords.data(), grid_weights.data(),
-        host_coords.data()
+        host_coords.data(),
+        global_atomic_grid_sizes_vec, max_grid_size
       );
     }
   }
@@ -219,7 +242,6 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
     exc.backward();
     c10::cuda::CUDACachingAllocator::emptyCache();
     EXC[0] = exc.item<double>();
-    // std::cout << "EXC: " << EXC[0] << std::endl;
   }
 
   if ( world_size == 1 ) {
@@ -238,10 +260,8 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
     device_data_ptr->send_static_data_onedft_results( total_npts, ndm, EXC,
       den_grad, dden_grad, tau_grad );
   } else { 
-    // GPU MPI path: atom reorder not yet implemented (empty inv_perm = no-op)
-    std::vector<int64_t> empty_inv_perm;
     total_npts = mpi_scatter_onedft_outputs(features_dict, rt.comm_rank(), rt.comm_size(),
-                                              recvcounts, displs, empty_inv_perm,
+                                              recvcounts, displs, atom_reorder_inv_perm,
                                               den_eval, dden_eval, tau);
     device_data_ptr->send_static_data_onedft_results( total_npts, ndm, EXC,
       den_eval.data(), dden_eval.data(), tau.data());
@@ -565,7 +585,9 @@ size_t save_static_data_onedft_features(XCDeviceData* _data, const integrator_te
 FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npts, const size_t ndm,
   const at::TensorOptions options, const std::vector<std::string> feature_keys,
   double* den_eval, double* dden_eval, double* tau, double* grid_coords, 
-  double* grid_weights, double* coords ) {
+  double* grid_weights, double* coords,
+  const std::vector<int64_t>& atomic_grid_sizes,
+  int64_t max_grid_size ) {
   auto device = torch::Device(torch::kCUDA, 0);
   FeatureDict featmap;
   for (const auto& key : feature_keys) {
@@ -604,6 +626,24 @@ FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npt
     case ONEDFT_FEATURE::COORDS: {
       auto flat_tensor = torch::from_blob(coords, {natoms * 3}, options);
       auto tensor = flat_tensor.view({natoms, 3}).to(device);
+      featmap.insert(key, tensor);
+      break;
+    }
+    case ONEDFT_FEATURE::ATOMIC_GRID_WEIGHTS: {
+      auto flat_tensor = torch::from_blob(grid_weights, {total_npts}, options);
+      auto tensor = flat_tensor.view({total_npts}).to(device);
+      featmap.insert(key, tensor);
+      break;
+    }
+    case ONEDFT_FEATURE::ATOMIC_GRID_SIZES: {
+      auto sizes_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+      auto tensor = torch::from_blob(const_cast<int64_t*>(atomic_grid_sizes.data()),
+                                     {static_cast<int64_t>(natoms)}, sizes_options).clone().to(device);
+      featmap.insert(key, tensor);
+      break;
+    }
+    case ONEDFT_FEATURE::ATOMIC_GRID_SIZE_BOUND_SHAPE: {
+      auto tensor = torch::zeros({max_grid_size}, options).to(device);
       featmap.insert(key, tensor);
       break;
     }
