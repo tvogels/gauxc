@@ -167,27 +167,9 @@ int mpi_scatter_onedft_outputs(const FeatureDict features_dict, // only exist in
 
   // Apply inverse atom-reorder: convert atom-ordered gradients back to rank-ordered
   // so each rank receives the correct values after Scatterv.
-  // Each channel is a contiguous block of total_npts values (stride 1).
   if (world_rank == 0 && !atom_reorder_inv_perm.empty()) {
-    auto inv_reorder_channel = [&](double* channel) {
-      std::vector<double> tmp(total_npts);
-      apply_strided_permutation(channel, tmp.data(), atom_reorder_inv_perm, total_npts, 1);
-      std::memcpy(channel, tmp.data(), total_npts * sizeof(double));
-    };
-    inv_reorder_channel(recv_den_eval_a);
-    inv_reorder_channel(recv_den_eval_b);
-    if (is_gga || is_mgga) {
-      inv_reorder_channel(recv_dden_x_eval_a);
-      inv_reorder_channel(recv_dden_y_eval_a);
-      inv_reorder_channel(recv_dden_z_eval_a);
-      inv_reorder_channel(recv_dden_x_eval_b);
-      inv_reorder_channel(recv_dden_y_eval_b);
-      inv_reorder_channel(recv_dden_z_eval_b);
-    }
-    if (is_mgga) {
-      inv_reorder_channel(recv_tau_a);
-      inv_reorder_channel(recv_tau_b);
-    }
+    reorder_to_rank_order(recv_den_eval, recv_dden_eval, recv_tau,
+                          atom_reorder_inv_perm, total_npts, is_gga, is_mgga);
   }
   
   if (world_size == 1) {
@@ -422,6 +404,58 @@ int mpi_gather_onedft_inputs(std::vector<double>& den_eval, std::vector<double>&
 #endif
 }
 
+AtomReorderResult mpi_gather_and_reorder(
+    std::vector<double>& den_eval,
+    std::vector<double>& dden_eval,
+    std::vector<double>& tau,
+    std::vector<double>& grid_coords,
+    std::vector<double>& grid_weights,
+    const std::vector<int64_t>& local_atomic_grid_sizes,
+    int total_npts, int natoms,
+    const RuntimeEnvironment& rt,
+    std::vector<int>& sendcounts,
+    std::vector<int>& displs) {
+
+  AtomReorderResult result;
+  result.global_atomic_grid_sizes = local_atomic_grid_sizes;
+  int world_rank = rt.comm_rank();
+
+  GAUXC_MPI_CODE(
+    total_npts = mpi_gather_onedft_inputs(den_eval, dden_eval, tau, grid_coords,
+      grid_weights, total_npts, world_rank, rt.comm_size(), sendcounts, displs);
+  );
+
+  GAUXC_MPI_CODE(
+    if (rt.comm_size() > 1) {
+      int world_size = rt.comm_size();
+
+      // Gather per-rank per-atom sizes to rank 0
+      std::vector<int64_t> all_rank_atom_sizes(world_rank == 0 ? world_size * natoms : 0);
+      MPI_Gather(local_atomic_grid_sizes.data(), natoms, MPI_INT64_T,
+                 all_rank_atom_sizes.data(), natoms, MPI_INT64_T,
+                 0, rt.comm());
+
+      if (world_rank == 0) {
+        // Compute global atom sizes by summing across ranks
+        result.global_atomic_grid_sizes.assign(natoms, 0);
+        for (int r = 0; r < world_size; ++r)
+          for (int a = 0; a < natoms; ++a)
+            result.global_atomic_grid_sizes[a] += all_rank_atom_sizes[r * natoms + a];
+
+        // Build permutation and reorder all arrays to atom-order
+        auto [perm, inv_perm] = build_atom_reorder_perm(
+          all_rank_atom_sizes, sendcounts, displs, natoms, world_size);
+        reorder_to_atom_order(grid_weights, den_eval, grid_coords,
+                              dden_eval, tau, perm, total_npts);
+        result.inv_perm = std::move(inv_perm);
+      }
+    }
+  );
+
+  result.total_npts = total_npts;
+  return result;
+}
+
 std::pair<std::vector<int64_t>, std::vector<int64_t>>
 build_atom_reorder_perm(const std::vector<int64_t>& all_rank_atom_sizes,
                         const std::vector<int>& sendcounts,
@@ -483,6 +517,58 @@ void apply_strided_permutation(const double* src, double* dst,
   for (int64_t i = 0; i < npts; ++i) {
     int64_t j = perm[i];
     std::copy(src + i * stride, src + (i + 1) * stride, dst + j * stride);
+  }
+}
+
+// --- Paired forward/inverse reorder helpers ---
+
+void reorder_to_atom_order(
+    std::vector<double>& grid_weights,
+    std::vector<double>& den_eval,
+    std::vector<double>& grid_coords,
+    std::vector<double>& dden_eval,
+    std::vector<double>& tau,
+    const std::vector<int64_t>& perm,
+    int64_t total_npts) {
+  auto reorder_vec = [&](std::vector<double>& vec, int stride) {
+    if (vec.empty()) return;
+    std::vector<double> tmp(vec.size());
+    apply_strided_permutation(vec.data(), tmp.data(), perm, total_npts, stride);
+    vec = std::move(tmp);
+  };
+  reorder_vec(grid_weights, 1);
+  reorder_vec(den_eval, 2);    // interleaved [alpha, beta] per point
+  reorder_vec(grid_coords, 3); // interleaved [x, y, z] per point
+  reorder_vec(dden_eval, 6);   // [dXa, dYa, dZa, dXb, dYb, dZb] per point
+  reorder_vec(tau, 2);         // interleaved [alpha, beta] per point
+}
+
+void reorder_to_rank_order(
+    std::vector<double>& recv_den_eval,
+    std::vector<double>& recv_dden_eval,
+    std::vector<double>& recv_tau,
+    const std::vector<int64_t>& inv_perm,
+    int64_t total_npts,
+    bool is_gga, bool is_mgga) {
+  // Gradient data is channel-first: each channel has total_npts contiguous values.
+  // Apply inv_perm (stride 1) to each channel independently.
+  auto inv_reorder_channel = [&](double* channel) {
+    std::vector<double> tmp(total_npts);
+    apply_strided_permutation(channel, tmp.data(), inv_perm, total_npts, 1);
+    std::memcpy(channel, tmp.data(), total_npts * sizeof(double));
+  };
+  // den_eval: [alpha(npts) | beta(npts)]
+  inv_reorder_channel(recv_den_eval.data());
+  inv_reorder_channel(recv_den_eval.data() + total_npts);
+  // dden_eval: [dXa(npts) | dYa | dZa | dXb | dYb | dZb]
+  if (is_gga || is_mgga) {
+    for (int c = 0; c < 6; ++c)
+      inv_reorder_channel(recv_dden_eval.data() + c * total_npts);
+  }
+  // tau: [alpha(npts) | beta(npts)]
+  if (is_mgga) {
+    inv_reorder_channel(recv_tau.data());
+    inv_reorder_channel(recv_tau.data() + total_npts);
   }
 }
 

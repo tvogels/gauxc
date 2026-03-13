@@ -720,58 +720,15 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
     }
   }
 
-  // For MPI: gather per-rank per-atom sizes to rank 0 so we can build a
-  // permutation that reorders the gathered flat data from rank-order to atom-order.
-  std::vector<int64_t> all_rank_atom_sizes;     // [world_size * natoms] on rank 0
-  std::vector<int64_t> global_atomic_grid_sizes_vec = atomic_grid_sizes_vec;
-  std::vector<int64_t> atom_reorder_perm;
-  std::vector<int64_t> atom_reorder_inv_perm_local;
-  GAUXC_MPI_CODE(
-    if (rt.comm_size() > 1) {
-      int world_size = rt.comm_size();
-      int world_rank_local = rt.comm_rank();
-      all_rank_atom_sizes.resize(world_rank_local == 0 ? world_size * natoms : 0);
-      MPI_Gather(atomic_grid_sizes_vec.data(), natoms, MPI_INT64_T,
-                 all_rank_atom_sizes.data(), natoms, MPI_INT64_T,
-                 0, rt.comm());
-      // Compute global sizes by summing across ranks (on rank 0)
-      if (world_rank_local == 0) {
-        global_atomic_grid_sizes_vec.assign(natoms, 0);
-        for (int r = 0; r < world_size; ++r)
-          for (int a = 0; a < natoms; ++a)
-            global_atomic_grid_sizes_vec[a] += all_rank_atom_sizes[r * natoms + a];
-      }
-    }
-  );
-  
+  // MPI gather all data to rank 0 and reorder from rank-order to atom-order
   int world_rank = rt.comm_rank();  
-  GAUXC_MPI_CODE(
-    total_npts = mpi_gather_onedft_inputs(den_eval, dden_eval, tau, grid_coords, grid_weights, total_npts, 
-      world_rank, rt.comm_size(), sendcounts, displs);
+  auto reorder_result = mpi_gather_and_reorder(
+    den_eval, dden_eval, tau, grid_coords, grid_weights,
+    atomic_grid_sizes_vec, total_npts, natoms, rt, sendcounts, displs);
+  total_npts = reorder_result.total_npts;
+  atom_reorder_inv_perm = std::move(reorder_result.inv_perm);
+  auto& global_atomic_grid_sizes_vec = reorder_result.global_atomic_grid_sizes;
 
-    // Reorder gathered flat arrays from rank-order to atom-order on rank 0
-    if (rt.comm_size() > 1 && world_rank == 0) {
-      auto [perm, inv_perm] = build_atom_reorder_perm(
-        all_rank_atom_sizes, sendcounts, displs, natoms, rt.comm_size());
-      atom_reorder_perm = std::move(perm);
-      atom_reorder_inv_perm_local = std::move(inv_perm);
-
-      auto reorder = [&](std::vector<double>& vec, int stride) {
-        if (vec.empty()) return;
-        std::vector<double> tmp(vec.size());
-        apply_strided_permutation(vec.data(), tmp.data(),
-                                  atom_reorder_perm, total_npts, stride);
-        vec = std::move(tmp);
-      };
-      reorder(grid_weights, 1);
-      reorder(den_eval, 2);    // interleaved [alpha, beta] per point
-      reorder(grid_coords, 3); // interleaved [x, y, z] per point
-      reorder(dden_eval, 6);   // [dXa, dYa, dZa, dXb, dYb, dZb] per point
-      reorder(tau, 2);         // interleaved [alpha, beta] per point
-    }
-  );
-  // Export the inverse permutation for the scatter path
-  atom_reorder_inv_perm = std::move(atom_reorder_inv_perm_local);
   FeatureDict featmap;
   if (world_rank == 0) {
     int64_t max_grid_size = *std::max_element(

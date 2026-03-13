@@ -6,6 +6,7 @@
 #endif
 #include <nlohmann/json.hpp>
 #include <gauxc/xc_integrator/local_work_driver.hpp>
+#include <gauxc/runtime_environment.hpp>
 
 using json = nlohmann::json;
 using IValueList = std::vector<c10::IValue>;
@@ -58,6 +59,28 @@ int mpi_gather_onedft_inputs(std::vector<double>& den_eval, std::vector<double>&
                           std::vector<double>& grid_weights, const int total_npts,
                           const int world_rank, const int world_size,
                           std::vector<int>& sendcounts, std::vector<int>& displs);
+
+  // Result of MPI gather + atom-reorder pipeline
+  struct AtomReorderResult {
+    std::vector<int64_t> global_atomic_grid_sizes;
+    std::vector<int64_t> inv_perm;
+    int total_npts;
+  };
+
+  // Gather local features from all ranks to rank 0, then reorder from
+  // rank-order to atom-order. Encapsulates MPI_Gather of atom sizes,
+  // mpi_gather_onedft_inputs, build_atom_reorder_perm, and reorder_to_atom_order.
+  AtomReorderResult mpi_gather_and_reorder(
+      std::vector<double>& den_eval,
+      std::vector<double>& dden_eval,
+      std::vector<double>& tau,
+      std::vector<double>& grid_coords,
+      std::vector<double>& grid_weights,
+      const std::vector<int64_t>& local_atomic_grid_sizes,
+      int total_npts, int natoms,
+      const RuntimeEnvironment& rt,
+      std::vector<int>& sendcounts,
+      std::vector<int>& displs);
                           
 int mpi_gather_onedft_inputs_gpu(std::vector<double>& den_eval, std::vector<double>& dden_eval,
                           std::vector<double>& tau, std::vector<double>& grid_coords,
@@ -83,9 +106,36 @@ int mpi_gather_onedft_inputs_gpu(std::vector<double>& den_eval, std::vector<doub
                             int natoms, int world_size);
 
   // Apply a point-level permutation to a strided array.
-  // For each point i, copies stride elements from src[perm[i]*stride .. +stride)
-  // to dst[i*stride .. +stride).
+  // For each point i, copies stride elements from src[i*stride..] to dst[perm[i]*stride..].
   void apply_strided_permutation(const double* src, double* dst,
                                  const std::vector<int64_t>& perm,
                                  int64_t npts, int stride);
+
+  // --- Paired forward/inverse reorder helpers ---
+  // These two functions form a symmetric pair: forward reorders gathered MPI data
+  // from rank-order to atom-order, inverse reverses atom-ordered gradients back
+  // to rank-order before Scatterv.
+
+  // Forward: reorder interleaved flat arrays from rank-order to atom-order.
+  // Applies perm with strides matching the interleaved data layout:
+  //   grid_weights(1), den_eval(2), grid_coords(3), dden_eval(6), tau(2).
+  void reorder_to_atom_order(
+      std::vector<double>& grid_weights,
+      std::vector<double>& den_eval,
+      std::vector<double>& grid_coords,
+      std::vector<double>& dden_eval,
+      std::vector<double>& tau,
+      const std::vector<int64_t>& perm,
+      int64_t total_npts);
+
+  // Inverse: reorder channel-first gradient arrays from atom-order to rank-order.
+  // Gradient data uses channel-first layout (each channel has total_npts contiguous
+  // values with stride 1): den[2*npts], dden[6*npts], tau[2*npts].
+  void reorder_to_rank_order(
+      std::vector<double>& recv_den_eval,
+      std::vector<double>& recv_dden_eval,
+      std::vector<double>& recv_tau,
+      const std::vector<int64_t>& inv_perm,
+      int64_t total_npts,
+      bool is_gga, bool is_mgga);
 } // namespace GauXC
