@@ -581,40 +581,28 @@ void reorder_to_atom_order_channel_first(
     const std::vector<int64_t>& perm,
     int64_t total_npts,
     bool is_gga, bool is_mgga) {
-  // Helper: permute a single channel (stride 1) in-place via temp buffer
-  auto permute_channel = [&](double* channel) {
-    std::vector<double> tmp(total_npts);
-    apply_strided_permutation(channel, tmp.data(), perm, total_npts, 1);
-    std::memcpy(channel, tmp.data(), total_npts * sizeof(double));
+  // Helper: permute a vector of nchannels × total_npts values (stride 1 per channel)
+  auto reorder_channels = [&](std::vector<double>& vec, int nchannels) {
+    if (vec.empty()) return;
+    std::vector<double> tmp(vec.size());
+    for (int c = 0; c < nchannels; ++c)
+      apply_strided_permutation(vec.data() + c * total_npts,
+                                tmp.data() + c * total_npts, perm, total_npts, 1);
+    vec = std::move(tmp);
+  };
+  // Helper: permute a strided vector (e.g. stride 3 for coords)
+  auto reorder_strided = [&](std::vector<double>& vec, int stride) {
+    if (vec.empty()) return;
+    std::vector<double> tmp(vec.size());
+    apply_strided_permutation(vec.data(), tmp.data(), perm, total_npts, stride);
+    vec = std::move(tmp);
   };
 
-  // grid_weights: stride 1 (single channel)
-  if (!grid_weights.empty()) {
-    std::vector<double> tmp(grid_weights.size());
-    apply_strided_permutation(grid_weights.data(), tmp.data(), perm, total_npts, 1);
-    grid_weights = std::move(tmp);
-  }
-  // grid_coords: stride 3 (interleaved per point)
-  if (!grid_coords.empty()) {
-    std::vector<double> tmp(grid_coords.size());
-    apply_strided_permutation(grid_coords.data(), tmp.data(), perm, total_npts, 3);
-    grid_coords = std::move(tmp);
-  }
-  // den_eval: channel-first [alpha(npts) | beta(npts)]
-  if (!den_eval.empty()) {
-    permute_channel(den_eval.data());
-    permute_channel(den_eval.data() + total_npts);
-  }
-  // dden_eval: channel-first [dXa(npts) | dYa | dZa | dXb | dYb | dZb]
-  if ((is_gga || is_mgga) && !dden_eval.empty()) {
-    for (int c = 0; c < 6; ++c)
-      permute_channel(dden_eval.data() + c * total_npts);
-  }
-  // tau: channel-first [alpha(npts) | beta(npts)]
-  if (is_mgga && !tau.empty()) {
-    permute_channel(tau.data());
-    permute_channel(tau.data() + total_npts);
-  }
+  reorder_strided(grid_weights, 1);
+  reorder_strided(grid_coords, 3);
+  reorder_channels(den_eval, 2);
+  if (is_gga || is_mgga) reorder_channels(dden_eval, 6);
+  if (is_mgga) reorder_channels(tau, 2);
 }
 
 AtomReorderResult mpi_gather_and_reorder_gpu(

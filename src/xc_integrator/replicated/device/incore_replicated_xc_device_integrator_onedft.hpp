@@ -216,6 +216,14 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
       host_coords[3*i+2] = mol[i].z;
     }
 
+    // Build host coords from molecule (avoids device-to-host copy of coords_device_data)
+    std::vector<double> host_coords(natoms * 3);
+    for (size_t i = 0; i < natoms; i++) {
+      host_coords[3*i]   = mol[i].x;
+      host_coords[3*i+1] = mol[i].y;
+      host_coords[3*i+2] = mol[i].z;
+    }
+
     auto reorder_result = mpi_gather_and_reorder_gpu(
       den_eval, dden_eval, tau, grid_coords, grid_weights,
       atomic_grid_sizes_vec, total_npts, natoms, rt, recvcounts, displs);
