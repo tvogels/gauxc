@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 #endif
 #include <iostream>
+#include <map>
 #include <gauxc/exceptions.hpp>
 #include <gauxc/util/mpi.hpp>
 namespace GauXC {
@@ -63,13 +64,24 @@ std::string map_model(const std::string& model, torch::DeviceType device) {
 
 std::tuple<torch::jit::Method, std::vector<std::string>>
 load_model(const std::string filename, torch::DeviceType device)
-{    
+{
+    // Cache loaded models to avoid re-reading from disk on every call.
+    // Key: (resolved_path, device_type)
+    using CacheKey = std::pair<std::string, torch::DeviceType>;
+    using CacheVal = std::tuple<torch::jit::script::Module, torch::jit::Method, std::vector<std::string>>;
+    static std::map<CacheKey, CacheVal> cache;
+
+    std::string model = map_model(filename, device);
+    CacheKey key{model, device};
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+      return std::make_tuple(std::get<1>(it->second), std::get<2>(it->second));
+    }
+
     torch::jit::script::Module mod;
     torch::jit::ExtraFilesMap extra_files{{"features", ""}, {"protocol_version", ""}};
     std::vector<std::string> keys;
-    std::string model = map_model(filename, device);
     try {
-        // Deserialize the ScriptModule from a file using torch::jit::load().
         mod = torch::jit::load(model, device, extra_files);
     }
     catch (const c10::Error& e) {
@@ -82,7 +94,6 @@ load_model(const std::string filename, torch::DeviceType device)
     }
 
     auto features = json::parse(extra_files.at("features"));
-    // check if features is array
     if (!features.is_array()) {
         GAUXC_GENERIC_EXCEPTION("features is not an array");
     }
@@ -93,7 +104,9 @@ load_model(const std::string filename, torch::DeviceType device)
         keys.push_back(feature.get<std::string>());
     }
 
-    return std::make_tuple(mod.get_method("get_exc_density"), keys);
+    auto method = mod.get_method("get_exc_density");
+    cache.emplace(key, CacheVal{std::move(mod), method, keys});
+    return std::make_tuple(method, keys);
 }
 
 at::Tensor
