@@ -250,6 +250,8 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
     exc.backward();
     c10::cuda::CUDACachingAllocator::emptyCache();
     EXC[0] = exc.item<double>();
+  } else {
+    EXC[0] = 0.0;
   }
 
   if ( world_size == 1 ) {
