@@ -677,6 +677,10 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
                   std::vector<int>& sendcounts, std::vector<int>& displs,
                   std::vector<int64_t>& atom_reorder_inv_perm) {
   std::vector<double> den_eval, dden_eval, tau, grid_coords, grid_weights;
+  // Sort tasks by atom index so that grid points are grouped by atom.
+  // build_atom_reorder_perm assumes this contiguous-by-atom layout.
+  std::stable_sort(tasks.begin(), tasks.end(),
+    [](const auto& a, const auto& b) { return a.iParent < b.iParent; });
   int total_npts = std::accumulate( tasks.begin(), tasks.end(), 0,
     [](const auto& a, const auto& b) { return a + b.npts; } );
   grid_coords.reserve(total_npts * 3);
@@ -712,7 +716,7 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
     std::copy(task.feat.tau.begin(), task.feat.tau.end(), std::back_inserter(tau));
   }
 
-  // Compute per-atom grid sizes from local tasks (tasks are sorted by iParent)
+  // Compute per-atom grid sizes from local tasks
   int natoms = mol.size();
   std::vector<int64_t> atomic_grid_sizes_vec(natoms, 0);
   for (const auto& task : tasks) {

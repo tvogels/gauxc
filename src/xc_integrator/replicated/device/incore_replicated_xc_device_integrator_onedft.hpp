@@ -82,7 +82,11 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
   }
 
   // Get Tasks
-  auto& tasks = this->load_balancer_->get_tasks();  
+  auto& tasks = this->load_balancer_->get_tasks();
+  // Sort tasks by atom index so that grid points are grouped by atom.
+  // build_atom_reorder_perm assumes this contiguous-by-atom layout.
+  std::stable_sort(tasks.begin(), tasks.end(),
+    [](const auto& a, const auto& b) { return a.iParent < b.iParent; });
   size_t total_npts = std::accumulate( tasks.begin(), tasks.end(), 0ul,
     [](const auto& a, const auto& b) { return a + b.npts; } );
 
