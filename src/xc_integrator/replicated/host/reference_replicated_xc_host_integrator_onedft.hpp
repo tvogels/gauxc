@@ -624,7 +624,6 @@ void eval_zmat_mgga_vxc_uks(size_t npts, size_t nbf,
     auto* bf_x_col = dbasis_x_eval + ioff;
     auto* bf_y_col = dbasis_y_eval + ioff;
     auto* bf_z_col = dbasis_z_eval + ioff;
-    auto* lbf_col = lbasis_eval + ioff;
 
     const double factp = 0.5 * vdden_eval_a[i];
     const double factm = 0.5 * vdden_eval_b[i];
@@ -648,6 +647,7 @@ void eval_zmat_mgga_vxc_uks(size_t npts, size_t nbf,
     GauXC::blas::axpy( nbf, z_factm, bf_z_col, 1, zz_col, 1 );
 
     if (vlapl_a != nullptr) {
+      auto* lbf_col = lbasis_eval + ioff;
       const auto lfactp = vlapl_a[i];
       const auto lfactm = vlapl_b[i];
       blas::axpy( nbf, 0.5*(lfactp + lfactm), lbf_col, 1, zs_col, 1);

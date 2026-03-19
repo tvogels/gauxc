@@ -112,8 +112,8 @@ int mpi_scatter_onedft_outputs(const FeatureDict features_dict, // only exist in
   // store data
   std::vector<double> recv_den_eval, recv_dden_eval, recv_tau;
 
-  int total_npts;
-  bool is_gga, is_mgga;
+  int total_npts = 0;
+  bool is_gga = false, is_mgga = false;
   if (world_rank == 0) {
     total_npts = features_dict.at(feat_map.at(ONEDFT_FEATURE::DEN)).size(1);
     is_gga = (features_dict.find(feat_map.at(ONEDFT_FEATURE::DDEN)) != features_dict.end());
@@ -245,7 +245,7 @@ int mpi_gather_onedft_inputs_gpu(std::vector<double>& den_eval, std::vector<doub
       displs_coords.resize(world_size);
     }
 
-    size_t displ = 0;
+    int displ = 0;
     MPI_Scan(&total_npts, &displ, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     displ -= total_npts;
     MPI_Gather(&total_npts, 1, MPI_INT, recvcounts.data(), 1, MPI_INT, 0, MPI_COMM_WORLD);
@@ -324,6 +324,7 @@ int mpi_gather_onedft_inputs_gpu(std::vector<double>& den_eval, std::vector<doub
     }
     return total_npts_sum;
 #endif
+    return 0;
 }
 
 int mpi_gather_onedft_inputs(std::vector<double>& den_eval, std::vector<double>& dden_eval,
@@ -402,6 +403,7 @@ int mpi_gather_onedft_inputs(std::vector<double>& den_eval, std::vector<double>&
     }
   return total_npts_sum;
 #endif
+    return 0;
 }
 
 AtomReorderResult mpi_gather_and_reorder(
