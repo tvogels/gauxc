@@ -88,6 +88,14 @@ target_link_libraries( standalone_driver PUBLIC gauxc gauxc_catch2 Eigen3::Eigen
 target_include_directories( standalone_driver PRIVATE ${PROJECT_BINARY_DIR}/tests )
 target_include_directories( standalone_driver PRIVATE ${PROJECT_SOURCE_DIR}/tests )
 
+add_executable( onedft_driver benchmarks/onedft_driver.cxx )
+target_link_libraries( onedft_driver PUBLIC gauxc Eigen3::Eigen )
+target_include_directories( onedft_driver PRIVATE ${PROJECT_BINARY_DIR}/tests )
+
+add_executable( benchmark benchmarks/benchmark.cxx )
+target_link_libraries( benchmark PUBLIC gauxc Eigen3::Eigen )
+target_include_directories( benchmark PRIVATE ${PROJECT_BINARY_DIR}/tests )
+
 #add_executable( grid_opt grid_opt.cxx standards.cxx basis/parse_basis.cxx ini_input.cxx )
 #target_link_libraries( grid_opt PUBLIC gauxc gauxc_catch2 Eigen3::Eigen )
 #target_include_directories( grid_opt PRIVATE ${PROJECT_BINARY_DIR}/tests )
