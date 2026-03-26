@@ -23,7 +23,8 @@ FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npt
   double* den_eval, double* dden_eval, double* tau, double* grid_coords, 
   double* grid_weights, double* coords,
   const std::vector<int64_t>& atomic_grid_sizes = {},
-  int64_t max_grid_size = 0 );
+  int64_t max_grid_size = 0,
+  double* raw_grid_weights = nullptr );
 
 size_t save_static_data_onedft_features (XCDeviceData* _data, const integrator_term_tracker enabled_terms, size_t offset);
 
@@ -174,6 +175,13 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
   std::vector<double> grid_weights, grid_coords, den_eval, dden_eval, tau;
   std::vector<int> displs(world_size), recvcounts(world_size);
 
+  // Collect raw (pre-partition) quadrature weights from tasks
+  std::vector<double> raw_grid_weights;
+  raw_grid_weights.reserve(total_npts);
+  for (const auto& task : tasks) {
+    raw_grid_weights.insert(raw_grid_weights.end(), task.raw_weights.begin(), task.raw_weights.end());
+  }
+
   // Compute per-atom grid sizes from tasks
   std::vector<int64_t> atomic_grid_sizes_vec(natoms, 0);
   for (const auto& task : tasks) {
@@ -196,7 +204,8 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
       device_data_ptr->dden_eval_device_data(), device_data_ptr->tau_device_data(),
       device_data_ptr->grid_coords_device_data(), device_data_ptr->grid_weights_device_data(),
       device_data_ptr->coords_device_data(),
-      atomic_grid_sizes_vec, max_grid_size
+      atomic_grid_sizes_vec, max_grid_size,
+      raw_grid_weights.data()
     );
   } else { // copy to host, gather, reorder, then back to device
     grid_weights.resize(total_npts);
@@ -235,6 +244,25 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
     atom_reorder_inv_perm = std::move(reorder_result.inv_perm);
     global_atomic_grid_sizes_vec = std::move(reorder_result.global_atomic_grid_sizes);
 
+    // Gather and reorder raw_grid_weights using the same MPI layout
+    GAUXC_MPI_CODE(
+      if (world_size > 1) {
+        int local_npts = (int)total_npts;
+        std::vector<double> recv_raw(world_rank == 0 ? total_npts_sum : 0);
+        MPI_Gatherv(raw_grid_weights.data(), local_npts, MPI_DOUBLE,
+                    recv_raw.data(), recvcounts.data(), displs.data(),
+                    MPI_DOUBLE, 0, rt.comm());
+        if (world_rank == 0) {
+          raw_grid_weights = std::move(recv_raw);
+          std::vector<int64_t> perm(total_npts_sum);
+          for (int64_t j = 0; j < total_npts_sum; j++) perm[atom_reorder_inv_perm[j]] = j;
+          std::vector<double> tmp(total_npts_sum);
+          for (int64_t i = 0; i < total_npts_sum; i++) tmp[perm[i]] = raw_grid_weights[i];
+          raw_grid_weights = std::move(tmp);
+        }
+      }
+    )
+
     if (world_rank == 0) {
       int64_t max_grid_size = *std::max_element(
         global_atomic_grid_sizes_vec.begin(), global_atomic_grid_sizes_vec.end());
@@ -243,7 +271,8 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
         natoms, total_npts_sum, ndm, options, feature_keys, den_eval.data(),
         dden_eval.data(), tau.data(), grid_coords.data(), grid_weights.data(),
         host_coords.data(),
-        global_atomic_grid_sizes_vec, max_grid_size
+        global_atomic_grid_sizes_vec, max_grid_size,
+        raw_grid_weights.data()
       );
     }
   }
@@ -600,7 +629,8 @@ FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npt
   double* den_eval, double* dden_eval, double* tau, double* grid_coords, 
   double* grid_weights, double* coords,
   const std::vector<int64_t>& atomic_grid_sizes,
-  int64_t max_grid_size ) {
+  int64_t max_grid_size,
+  double* raw_grid_weights ) {
   auto device = torch::Device(torch::kCUDA, 0);
   FeatureDict featmap;
   for (const auto& key : feature_keys) {
@@ -643,7 +673,12 @@ FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npt
       break;
     }
     case ONEDFT_FEATURE::ATOMIC_GRID_WEIGHTS: {
-      auto flat_tensor = torch::from_blob(grid_weights, {total_npts}, options);
+      // Use raw (pre-partition) quadrature weights if available
+      double* w_ptr = raw_grid_weights ? raw_grid_weights : grid_weights;
+      auto w_opts = raw_grid_weights
+        ? torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU)
+        : options;
+      auto flat_tensor = torch::from_blob(w_ptr, {total_npts}, w_opts);
       auto tensor = flat_tensor.view({total_npts}).to(device);
       featmap.insert(key, tensor);
       break;
@@ -656,7 +691,8 @@ FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npt
       break;
     }
     case ONEDFT_FEATURE::ATOMIC_GRID_SIZE_BOUND_SHAPE: {
-      auto tensor = torch::zeros({max_grid_size}, options).to(device);
+      auto sizes_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+      auto tensor = torch::zeros({max_grid_size, 0}, sizes_options).to(device);
       featmap.insert(key, tensor);
       break;
     }

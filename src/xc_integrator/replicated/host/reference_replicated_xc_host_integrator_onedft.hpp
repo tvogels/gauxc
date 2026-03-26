@@ -676,7 +676,7 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
                   const std::vector<std::string> feature_keys, const RuntimeEnvironment& rt,
                   std::vector<int>& sendcounts, std::vector<int>& displs,
                   std::vector<int64_t>& atom_reorder_inv_perm) {
-  std::vector<double> den_eval, dden_eval, tau, grid_coords, grid_weights;
+  std::vector<double> den_eval, dden_eval, tau, grid_coords, grid_weights, raw_grid_weights;
   // Sort tasks by atom index so that grid points are grouped by atom.
   // build_atom_reorder_perm assumes this contiguous-by-atom layout.
   std::stable_sort(tasks.begin(), tasks.end(),
@@ -685,6 +685,7 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
     [](const auto& a, const auto& b) { return a + b.npts; } );
   grid_coords.reserve(total_npts * 3);
   grid_weights.reserve(total_npts);
+  raw_grid_weights.reserve(total_npts);
   den_eval.reserve(total_npts * ndm);
   dden_eval.resize(total_npts * 6);  // 2 values per point, 3 components
   tau.reserve(total_npts * ndm);
@@ -697,6 +698,7 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
       grid_coords.push_back(point[2]);
     }
     std::copy(task.weights.begin(), task.weights.end(), std::back_inserter(grid_weights));
+    std::copy(task.raw_weights.begin(), task.raw_weights.end(), std::back_inserter(raw_grid_weights));
     std::copy(task.feat.den_eval.begin(), task.feat.den_eval.end(), std::back_inserter(den_eval));
 
     if (task.feat.dden_x_eval.size() != 0){
@@ -726,13 +728,33 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
   }
 
   // MPI gather all data to rank 0 and reorder from rank-order to atom-order
-  int world_rank = rt.comm_rank();  
+  int world_rank = rt.comm_rank();
+  int local_npts = total_npts; // save before gather overwrites
   auto reorder_result = mpi_gather_and_reorder(
     den_eval, dden_eval, tau, grid_coords, grid_weights,
     atomic_grid_sizes_vec, total_npts, natoms, rt, sendcounts, displs);
   total_npts = reorder_result.total_npts;
   atom_reorder_inv_perm = std::move(reorder_result.inv_perm);
   auto& global_atomic_grid_sizes_vec = reorder_result.global_atomic_grid_sizes;
+
+  // Gather and reorder raw_grid_weights using the same MPI layout
+  GAUXC_MPI_CODE(
+    if (rt.comm_size() > 1) {
+      std::vector<double> recv_raw(world_rank == 0 ? total_npts : 0);
+      MPI_Gatherv(raw_grid_weights.data(), local_npts, MPI_DOUBLE,
+                  recv_raw.data(), sendcounts.data(), displs.data(),
+                  MPI_DOUBLE, 0, rt.comm());
+      if (world_rank == 0) {
+        raw_grid_weights = std::move(recv_raw);
+        // Reconstruct forward perm from inv_perm and reorder
+        std::vector<int64_t> perm(total_npts);
+        for (int64_t j = 0; j < total_npts; j++) perm[atom_reorder_inv_perm[j]] = j;
+        std::vector<double> tmp(total_npts);
+        for (int64_t i = 0; i < total_npts; i++) tmp[perm[i]] = raw_grid_weights[i];
+        raw_grid_weights = std::move(tmp);
+      }
+    }
+  )
 
   FeatureDict featmap;
   if (world_rank == 0) {
@@ -781,7 +803,7 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
         break;
       }
       case ONEDFT_FEATURE::ATOMIC_GRID_WEIGHTS: {
-        auto flat_tensor = torch::from_blob(grid_weights.data(), {total_npts}, options);
+        auto flat_tensor = torch::from_blob(raw_grid_weights.data(), {total_npts}, options);
         tensor = flat_tensor.clone();
         break;
       }
@@ -791,7 +813,8 @@ FeatureDict prepare_onedft_features(const int ndm, std::vector<XCTask>& tasks, c
         break;
       }
       case ONEDFT_FEATURE::ATOMIC_GRID_SIZE_BOUND_SHAPE: {
-        tensor = torch::zeros({max_grid_size}, options);
+        auto sizes_options = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        tensor = torch::zeros({max_grid_size, 0}, sizes_options);
         break;
       }
       default:
