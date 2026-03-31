@@ -17,7 +17,7 @@
 namespace GauXC {
 
 // Transform OneDFT per-component Vxc to the standard format expected by
-// inc_exc_grad_gga/mgga kernels. In OneDFT:
+// inc_exc_grad_gga/mgga kernels (only called for GGA/MGGA paths). In OneDFT:
 //   gamma_pp  = dden_x_grad_a  (per-direction derivative, alpha)
 //   vgamma_pp = dden_x_grad_b  (per-direction derivative, beta)
 //   gamma_pm  = dden_y_grad_a

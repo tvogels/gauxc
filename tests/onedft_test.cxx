@@ -162,9 +162,13 @@ void test_onedft_gradient( ExecutionSpace ex, const RuntimeEnvironment& rt,
 
     OneDFTSettings onedft_settings;
     onedft_settings.model = onedft_model_path;
-    auto EXC_GRAD = is_uks ?
-      integrator.eval_exc_grad_onedft( P, Pz, onedft_settings ) :
-      integrator.eval_exc_grad_onedft( P, Pz, onedft_settings ); // RKS would pass (P, zero_matrix)
+    std::vector<double> EXC_GRAD;
+    if (is_uks) {
+      EXC_GRAD = integrator.eval_exc_grad_onedft( P, Pz, onedft_settings );
+    } else {
+      matrix_type Pz_zero = matrix_type::Zero( P.rows(), P.cols() );
+      EXC_GRAD = integrator.eval_exc_grad_onedft( P, Pz_zero, onedft_settings );
+    }
 
     // Finite-difference gradient
     const double h = 1e-4; // step size in Bohr
@@ -197,9 +201,9 @@ void test_onedft_gradient( ExecutionSpace ex, const RuntimeEnvironment& rt,
       max_err = std::max(max_err, err);
       INFO("Component " << i << ": analytic=" << EXC_GRAD[i]
            << " FD=" << fd_grad[i] << " err=" << err);
-      // h=1e-4 gives FD accuracy ~h^2 = 1e-8, but with grid reconstruction
-      // errors we expect ~1e-5 to 1e-6 agreement
-      CHECK( err < 1e-4 );
+      // Central FD with h=1e-4 gives O(h²)=1e-8 truncation error;
+      // grid reconstruction at perturbed geometry adds ~1e-6 noise
+      CHECK( err < 1e-5 );
     }
     INFO("Max gradient error: " << max_err);
 }
@@ -288,9 +292,6 @@ TEST_CASE( "OneDFT", "[onedft]" ) {
 }
 
 TEST_CASE( "OneDFT Gradient", "[onedft][gradient]" ) {
-    // Note: Gradient test uses finite-difference validation against OneDFT energy.
-    // The test molecule should have >1 atom for meaningful forces.
-    // He atom test verifies that single-atom forces are (near) zero.
     SECTION( " HE / def2-qzvp / pbe.fun - UKS" ) {
         test_gradient( GAUXC_REF_DATA_PATH "/onedft_he_def2qzvp_pbe_uks.hdf5",
                        GAUXC_ONEDFT_MODEL_PATH "/pbe.fun", /*is_uks=*/true );
@@ -298,6 +299,10 @@ TEST_CASE( "OneDFT Gradient", "[onedft][gradient]" ) {
     SECTION( " HE / def2-qzvp / lda.fun - UKS" ) {
         test_gradient( GAUXC_REF_DATA_PATH "/onedft_he_def2qzvp_lda_uks.hdf5",
                        GAUXC_ONEDFT_MODEL_PATH "/lda.fun", /*is_uks=*/true );
+    }
+    SECTION( " HE / def2-qzvp / pbe.fun - RKS" ) {
+        test_gradient( GAUXC_REF_DATA_PATH "/onedft_he_def2qzvp_pbe_uks.hdf5",
+                       GAUXC_ONEDFT_MODEL_PATH "/pbe.fun", /*is_uks=*/false );
     }
 }
 

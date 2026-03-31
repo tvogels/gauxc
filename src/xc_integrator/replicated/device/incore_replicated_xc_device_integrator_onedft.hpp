@@ -789,7 +789,7 @@ eval_exc_grad_onedft_( int64_t m, int64_t n, const value_type* Ps, int64_t ldps,
   }
   std::vector<int64_t> atomic_grid_sizes_vec(natoms, 0);
   for (const auto& task : tasks) {
-    if (task.iParent >= 0 && task.iParent < (int)natoms) {
+    if (task.iParent >= 0 && task.iParent < static_cast<int>(natoms)) {
       atomic_grid_sizes_vec[task.iParent] += task.npts;
     }
   }
@@ -850,6 +850,25 @@ eval_exc_grad_onedft_( int64_t m, int64_t n, const value_type* Ps, int64_t ldps,
       den_eval, dden_eval, tau, grid_coords, grid_weights,
       atomic_grid_sizes_vec, total_npts, natoms, rt, recvcounts, displs);
     atom_reorder_inv_perm = std::move(reorder_result.inv_perm);
+
+    // Gather and reorder raw_grid_weights using the same MPI layout
+    GAUXC_MPI_CODE(
+      if (world_size > 1) {
+        int local_npts = static_cast<int>(total_npts);
+        std::vector<double> recv_raw(world_rank == 0 ? reorder_result.total_npts : 0);
+        MPI_Gatherv(raw_grid_weights.data(), local_npts, MPI_DOUBLE,
+                    recv_raw.data(), recvcounts.data(), displs.data(),
+                    MPI_DOUBLE, 0, rt.comm());
+        if (world_rank == 0) {
+          raw_grid_weights = std::move(recv_raw);
+          std::vector<int64_t> perm(reorder_result.total_npts);
+          for (int64_t j = 0; j < reorder_result.total_npts; j++) perm[atom_reorder_inv_perm[j]] = j;
+          std::vector<double> tmp(reorder_result.total_npts);
+          for (int64_t i = 0; i < reorder_result.total_npts; i++) tmp[perm[i]] = raw_grid_weights[i];
+          raw_grid_weights = std::move(tmp);
+        }
+      }
+    )
 
     if (world_rank == 0) {
       int64_t max_grid_size = *std::max_element(
