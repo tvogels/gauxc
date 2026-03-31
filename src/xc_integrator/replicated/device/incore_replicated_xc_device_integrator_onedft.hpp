@@ -695,4 +695,474 @@ FeatureDict prepare_onedft_features( const size_t natoms, const size_t total_npt
   }
   return featmap;
 }
+} // namespace GauXC::detail (prepare_onedft_features)
+
+// ============================================================================
+// OneDFT EXC Gradient — Device Implementation
+// ============================================================================
+
+namespace GauXC::detail {
+
+template <typename ValueType>
+void IncoreReplicatedXCDeviceIntegrator<ValueType>::
+eval_exc_grad_onedft_( int64_t m, int64_t n, const value_type* Ps, int64_t ldps,
+                       const value_type* Pz, int64_t ldpz, value_type* EXC_GRAD,
+                       const IntegratorSettingsXC& settings ) {
+
+  const auto& basis = this->load_balancer_->basis();
+  const int64_t nbf = basis.nbf();
+  if( m != n )    GAUXC_GENERIC_EXCEPTION("P Must Be Square");
+  if( m != nbf )  GAUXC_GENERIC_EXCEPTION("P Must Have Same Dimension as Basis");
+  if( ldps < nbf) GAUXC_GENERIC_EXCEPTION("Invalid LDPS");
+  if( ldpz && ldpz < nbf ) GAUXC_GENERIC_EXCEPTION("Invalid LDPZ");
+
+  const bool is_uks = (Pz != nullptr);
+  const size_t ndm = is_uks ? 2 : 1;
+
+  auto& tasks = this->load_balancer_->get_tasks();
+  // Sort tasks by atom so grid points are contiguous per atom
+  std::stable_sort(tasks.begin(), tasks.end(),
+    [](const auto& a, const auto& b) { return a.iParent < b.iParent; });
+  size_t total_npts = std::accumulate( tasks.begin(), tasks.end(), 0ul,
+    [](const auto& a, const auto& b) { return a + b.npts; } );
+
+  auto* lwd = dynamic_cast<LocalDeviceWorkDriver*>(this->local_work_driver_.get());
+  auto rt  = detail::as_device_runtime(this->load_balancer_->runtime());
+  auto device_data_ptr = lwd->create_device_data(rt);
+
+  int32_t world_rank = rt.comm_rank();
+  int32_t world_size = rt.comm_size();
+
+  // Load model
+  OneDFTSettings onedft_settings;
+  if( auto* tmp = dynamic_cast<const OneDFTSettings*>(&settings) ) {
+    onedft_settings = *tmp;
+  }
+  const auto model_path = onedft_settings.model;
+  torch::DeviceType torch_device = torch::kCPU;
+  auto [exc_func, feature_keys] = load_model(model_path, torch_device);
+
+  // Determine feature requirements
+  bool is_gga = false;
+  bool is_mgga = false;
+  for (const auto& key : feature_keys) {
+    if ( not valueExists(key) ) GAUXC_GENERIC_EXCEPTION("Feature Key Required Not Implemented: " + key);
+    if (key == feat_map.at(ONEDFT_FEATURE::TAU)) is_mgga = true;
+    if (key == feat_map.at(ONEDFT_FEATURE::DDEN)) is_gga = true;
+  }
+  if (is_mgga) is_gga = false;
+
+  const auto& mol   = this->load_balancer_->molecule();
+  const auto natoms = mol.natoms();
+  const auto nshells = basis.nshells();
+
+  // Phase 1: Pre-work — compute density features on device
+  integrator_term_tracker enabled_terms;
+  enabled_terms.exc_vxc = true;
+  enabled_terms.onedft = true;
+  enabled_terms.exc_grad = true;
+  if (is_uks) enabled_terms.ks_scheme = UKS;
+  else        enabled_terms.ks_scheme = RKS;
+
+  if (is_mgga)     enabled_terms.xc_approx = integrator_xc_approx::MGGA_TAU;
+  else if (is_gga) enabled_terms.xc_approx = integrator_xc_approx::GGA;
+  else             enabled_terms.xc_approx = integrator_xc_approx::LDA;
+
+  device_data_ptr->reset_allocations();
+  device_data_ptr->allocate_static_data_onedft( nbf, nshells, natoms, total_npts, enabled_terms );
+  device_data_ptr->send_static_data_onedft( mol, Ps, ldps, Pz, ldpz, nullptr, 0, nullptr, 0, basis );
+  device_data_ptr->zero_exc_grad_integrands();
+
+  // Pre-OneDFT density computation on device
+  integrator_term_tracker pre_terms = enabled_terms;
+  pre_terms.exc_grad = false;
+  this->timer_.time_op("XCIntegrator.LocalWork_PreOneDFT", [&](){
+    pre_onedft_local_work_( basis, Ps, ldps, Pz, ldpz, nullptr, 0, nullptr, 0,
+      tasks.begin(), tasks.end(), *device_data_ptr, pre_terms );
+  });
+
+  // Collect raw quadrature weights and atomic grid sizes
+  std::vector<double> raw_grid_weights;
+  raw_grid_weights.reserve(total_npts);
+  for (const auto& task : tasks) {
+    raw_grid_weights.insert(raw_grid_weights.end(), task.raw_weights.begin(), task.raw_weights.end());
+  }
+  std::vector<int64_t> atomic_grid_sizes_vec(natoms, 0);
+  for (const auto& task : tasks) {
+    if (task.iParent >= 0 && task.iParent < static_cast<int>(natoms)) {
+      atomic_grid_sizes_vec[task.iParent] += task.npts;
+    }
+  }
+
+  // Phase 2: Retrieve features and run model
+  FeatureDict features_dict;
+  std::vector<int64_t> atom_reorder_inv_perm;
+  std::vector<double> den_eval, dden_eval, tau;
+  std::vector<int> displs(world_size), recvcounts(world_size);
+
+  if (world_size == 1) {
+    std::vector<double> grid_weights(total_npts), grid_coords(total_npts * 3);
+    den_eval.resize(total_npts * ndm);
+    if (is_gga || is_mgga) dden_eval.resize(total_npts * ndm * 3);
+    if (is_mgga) tau.resize(total_npts * ndm);
+
+    device_data_ptr->retrieve_onedft_features( total_npts, ndm, den_eval.data(),
+      (is_gga || is_mgga) ? dden_eval.data() : nullptr,
+      is_mgga ? tau.data() : nullptr,
+      grid_coords.data(), grid_weights.data() );
+    rt.device_backend()->master_queue_synchronize();
+
+    std::vector<double> host_coords(natoms * 3);
+    for (size_t i = 0; i < (size_t)natoms; i++) {
+      host_coords[3*i]   = mol[i].x;
+      host_coords[3*i+1] = mol[i].y;
+      host_coords[3*i+2] = mol[i].z;
+    }
+
+    int64_t max_grid_size = *std::max_element(
+      atomic_grid_sizes_vec.begin(), atomic_grid_sizes_vec.end());
+    auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
+    features_dict = prepare_onedft_features(
+      natoms, total_npts, ndm, options, feature_keys, den_eval.data(),
+      dden_eval.data(), tau.data(), grid_coords.data(), grid_weights.data(),
+      host_coords.data(), atomic_grid_sizes_vec, max_grid_size,
+      raw_grid_weights.data() );
+  } else {
+    std::vector<double> grid_weights(total_npts), grid_coords(total_npts * 3);
+    den_eval.resize(total_npts * ndm);
+    if (is_gga || is_mgga) dden_eval.resize(total_npts * ndm * 3);
+    if (is_mgga) tau.resize(total_npts * ndm);
+
+    device_data_ptr->retrieve_onedft_features( total_npts, ndm, den_eval.data(),
+      (is_gga || is_mgga) ? dden_eval.data() : nullptr,
+      is_mgga ? tau.data() : nullptr,
+      grid_coords.data(), grid_weights.data() );
+    rt.device_backend()->master_queue_synchronize();
+
+    std::vector<double> host_coords(natoms * 3);
+    for (size_t i = 0; i < (size_t)natoms; i++) {
+      host_coords[3*i]   = mol[i].x;
+      host_coords[3*i+1] = mol[i].y;
+      host_coords[3*i+2] = mol[i].z;
+    }
+
+    auto reorder_result = mpi_gather_and_reorder_gpu(
+      den_eval, dden_eval, tau, grid_coords, grid_weights,
+      atomic_grid_sizes_vec, total_npts, natoms, rt, recvcounts, displs);
+    atom_reorder_inv_perm = std::move(reorder_result.inv_perm);
+
+    // Gather and reorder raw_grid_weights using the same MPI layout
+    GAUXC_MPI_CODE(
+      if (world_size > 1) {
+        int local_npts = static_cast<int>(total_npts);
+        std::vector<double> recv_raw(world_rank == 0 ? reorder_result.total_npts : 0);
+        MPI_Gatherv(raw_grid_weights.data(), local_npts, MPI_DOUBLE,
+                    recv_raw.data(), recvcounts.data(), displs.data(),
+                    MPI_DOUBLE, 0, rt.comm());
+        if (world_rank == 0) {
+          raw_grid_weights = std::move(recv_raw);
+          std::vector<int64_t> perm(reorder_result.total_npts);
+          for (int64_t j = 0; j < reorder_result.total_npts; j++) perm[atom_reorder_inv_perm[j]] = j;
+          std::vector<double> tmp(reorder_result.total_npts);
+          for (int64_t i = 0; i < reorder_result.total_npts; i++) tmp[perm[i]] = raw_grid_weights[i];
+          raw_grid_weights = std::move(tmp);
+        }
+      }
+    )
+
+    if (world_rank == 0) {
+      int64_t max_grid_size = *std::max_element(
+        reorder_result.global_atomic_grid_sizes.begin(),
+        reorder_result.global_atomic_grid_sizes.end());
+      auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
+      features_dict = prepare_onedft_features(
+        natoms, reorder_result.total_npts, ndm, options, feature_keys,
+        den_eval.data(), dden_eval.data(), tau.data(),
+        grid_coords.data(), grid_weights.data(), host_coords.data(),
+        reorder_result.global_atomic_grid_sizes, max_grid_size,
+        raw_grid_weights.data() );
+    }
+  }
+
+  // Phase 3: Forward + backward with requires_grad on POINTS and COORDS
+  std::vector<double> eps_on_grid_global;
+  std::vector<double> points_grad_global;
+  std::vector<double> coords_grad_global;
+  int total_npts_model = 0;
+
+  if (world_rank == 0) {
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::POINTS)) != features_dict.end()) {
+      features_dict.at(feat_map.at(ONEDFT_FEATURE::POINTS)).requires_grad_(true);
+    }
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::COORDS)) != features_dict.end()) {
+      features_dict.at(feat_map.at(ONEDFT_FEATURE::COORDS)).requires_grad_(true);
+    }
+
+    auto exc_on_grid = get_exc(exc_func, features_dict);
+    if (exc_on_grid.isnan().any().item<bool>()) {
+      GAUXC_GENERIC_EXCEPTION("exc_on_grid has NaN");
+    }
+    auto exc = (exc_on_grid * features_dict.at(feat_map.at(ONEDFT_FEATURE::WEIGHTS))).sum();
+    exc.backward();
+
+    total_npts_model = exc_on_grid.size(0);
+    at::Tensor eps_cpu = exc_on_grid.detach().cpu().contiguous();
+    eps_on_grid_global.resize(total_npts_model);
+    std::memcpy(eps_on_grid_global.data(), eps_cpu.data_ptr<double>(),
+                total_npts_model * sizeof(double));
+
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::POINTS)) != features_dict.end()) {
+      auto pg = features_dict.at(feat_map.at(ONEDFT_FEATURE::POINTS)).grad();
+      if (pg.defined()) {
+        at::Tensor pg_cpu = pg.cpu().contiguous();
+        points_grad_global.resize(total_npts_model * 3);
+        std::memcpy(points_grad_global.data(), pg_cpu.data_ptr<double>(),
+                    total_npts_model * 3 * sizeof(double));
+      }
+    }
+
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::COORDS)) != features_dict.end()) {
+      auto cg = features_dict.at(feat_map.at(ONEDFT_FEATURE::COORDS)).grad();
+      if (cg.defined()) {
+        at::Tensor cg_cpu = cg.cpu().contiguous();
+        coords_grad_global.resize(natoms * 3);
+        std::memcpy(coords_grad_global.data(), cg_cpu.data_ptr<double>(),
+                    natoms * 3 * sizeof(double));
+      }
+    }
+
+    // Reorder from atom-order back to rank-order
+    if (!atom_reorder_inv_perm.empty()) {
+      std::vector<double> tmp(total_npts_model);
+      for (int64_t i = 0; i < total_npts_model; i++) {
+        tmp[atom_reorder_inv_perm[i]] = eps_on_grid_global[i];
+      }
+      eps_on_grid_global = std::move(tmp);
+
+      if (!points_grad_global.empty()) {
+        std::vector<double> tmp3(total_npts_model * 3);
+        for (int64_t i = 0; i < total_npts_model; i++) {
+          int64_t j = atom_reorder_inv_perm[i];
+          tmp3[j*3+0] = points_grad_global[i*3+0];
+          tmp3[j*3+1] = points_grad_global[i*3+1];
+          tmp3[j*3+2] = points_grad_global[i*3+2];
+        }
+        points_grad_global = std::move(tmp3);
+      }
+    }
+  }
+
+  // Phase 4: Send OneDFT Vxc outputs back to device
+  if (world_size == 1) {
+    double* den_grad  = features_dict.at(feat_map.at(ONEDFT_FEATURE::DEN)).grad().data_ptr<double>();
+    double* dden_grad = nullptr;
+    double* tau_grad  = nullptr;
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::DDEN)) != features_dict.end()) {
+      dden_grad = features_dict.at(feat_map.at(ONEDFT_FEATURE::DDEN)).grad().data_ptr<double>();
+    }
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::TAU)) != features_dict.end()) {
+      tau_grad = features_dict.at(feat_map.at(ONEDFT_FEATURE::TAU)).grad().data_ptr<double>();
+    }
+    double exc_val = 0.0;
+    device_data_ptr->send_static_data_onedft_results( total_npts, ndm, &exc_val,
+      den_grad, dden_grad, tau_grad );
+  } else {
+    total_npts = mpi_scatter_onedft_outputs(features_dict, rt.comm_rank(), rt.comm_size(),
+                                              recvcounts, displs, atom_reorder_inv_perm,
+                                              den_eval, dden_eval, tau);
+    double exc_val = 0.0;
+    device_data_ptr->send_static_data_onedft_results( total_npts, ndm, &exc_val,
+      den_eval.data(), dden_eval.data(), tau.data());
+  }
+
+  // Scatter eps_on_grid and points_grad to local ranks
+  std::vector<double> eps_on_grid_local;
+  std::vector<double> points_grad_local;
+  if (world_size == 1) {
+    eps_on_grid_local = std::move(eps_on_grid_global);
+    points_grad_local = std::move(points_grad_global);
+  } else {
+#ifdef GAUXC_HAS_MPI
+    MPI_Bcast(&total_npts_model, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    int local_npts = 0;
+    MPI_Scatter(recvcounts.data(), 1, MPI_INT, &local_npts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    eps_on_grid_local.resize(local_npts);
+    MPI_Scatterv(eps_on_grid_global.data(), recvcounts.data(), displs.data(), MPI_DOUBLE,
+                 eps_on_grid_local.data(), local_npts, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    bool has_points_grad = !points_grad_global.empty();
+    MPI_Bcast(&has_points_grad, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
+    if (has_points_grad) {
+      std::vector<int> recvcounts3(world_size), displs3(world_size);
+      for (int i = 0; i < world_size; ++i) {
+        recvcounts3[i] = recvcounts[i] * 3;
+        displs3[i] = displs[i] * 3;
+      }
+      points_grad_local.resize(local_npts * 3);
+      MPI_Scatterv(points_grad_global.data(), recvcounts3.data(), displs3.data(), MPI_DOUBLE,
+                   points_grad_local.data(), local_npts * 3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    }
+#else
+    GAUXC_GENERIC_EXCEPTION("MPI not available but comm_size > 1");
+#endif
+  }
+
+  // Zero out EXC_GRAD on host
+  for (int i = 0; i < 3*natoms; ++i) EXC_GRAD[i] = 0.0;
+
+  // Phase 5: Pulay gradient + weight derivative on device
+  auto& lb_state = this->load_balancer_->state();
+  if( not lb_state.modified_weights_are_stored ) {
+    GAUXC_GENERIC_EXCEPTION("Weights Have Not Been Modified");
+  }
+  XCWeightAlg& weight_alg = lb_state.weight_alg;
+
+  BasisSetMap basis_map(basis, mol);
+  const auto& meta = this->load_balancer_->molmeta();
+  device_data_ptr->populate_submat_maps( nbf, tasks.begin(), tasks.end(), basis_map );
+
+  auto task_comparator = []( const XCTask& a, const XCTask& b ) {
+    return (a.points.size() * a.bfn_screening.nbe) > (b.points.size() * b.bfn_screening.nbe);
+  };
+
+  // Distribute eps to per-task storage (in iParent order before sorting)
+  {
+    size_t offset = 0;
+    for (auto& task : tasks) {
+      int64_t npts = task.points.size();
+      task.feat.eps.resize(npts);
+      std::copy(eps_on_grid_local.data() + offset,
+                eps_on_grid_local.data() + offset + npts,
+                task.feat.eps.begin());
+      offset += npts;
+    }
+  }
+
+  std::sort( tasks.begin(), tasks.end(), task_comparator );
+
+  // Build eps*w array in sorted task order
+  std::vector<double> eps_w_all;
+  eps_w_all.reserve(total_npts);
+  for (const auto& task : tasks) {
+    for (size_t ipt = 0; ipt < task.points.size(); ++ipt) {
+      eps_w_all.push_back(task.feat.eps[ipt] * task.weights[ipt]);
+    }
+  }
+
+  // Set up gradient terms
+  const auto ks_scheme = is_uks ? UKS : RKS;
+  integrator_term_tracker grad_terms;
+  grad_terms.exc_grad = true;
+  grad_terms.weights  = true;
+  grad_terms.onedft   = true;
+  grad_terms.ks_scheme = ks_scheme;
+  if (is_mgga)     grad_terms.xc_approx = integrator_xc_approx::MGGA_TAU;
+  else if (is_gga) grad_terms.xc_approx = integrator_xc_approx::GGA;
+  else             grad_terms.xc_approx = integrator_xc_approx::LDA;
+
+  device_data_ptr->allocate_static_data_weights( natoms );
+  device_data_ptr->send_static_data_weights( mol, meta );
+
+  this->timer_.time_op("XCIntegrator.LocalWork_OneDFTGrad", [&](){
+    auto task_it = tasks.begin();
+    size_t vxc_offset = 0;
+    size_t eps_offset = 0;
+    while( task_it != tasks.end() ) {
+
+      auto batch_begin = task_it;
+
+      task_it = device_data_ptr->generate_buffers( grad_terms, basis_map,
+                                                     task_it, tasks.end() );
+
+      vxc_offset = send_buffer_onedft_outputs( device_data_ptr.get(), grad_terms, vxc_offset );
+
+      if (is_gga || is_mgga) lwd->eval_collocation_hessian( device_data_ptr.get() );
+      else                   lwd->eval_collocation_gradient( device_data_ptr.get() );
+
+      const double xmat_fac = 1.0;
+      const bool need_xmat_grad = is_gga || is_mgga;
+      auto do_xmat = [&](density_id den_id) {
+        lwd->eval_xmat( xmat_fac, device_data_ptr.get(), need_xmat_grad, den_id );
+        lwd->save_xmat( device_data_ptr.get(), need_xmat_grad, den_id );
+      };
+      do_xmat(DEN_S);
+      if (is_uks) do_xmat(DEN_Z);
+
+      if (is_gga || is_mgga) {
+        lwd->transform_onedft_vxc_for_grad( device_data_ptr.get() );
+      }
+
+      const bool with_weight_derivatives = true;
+      if (is_mgga)     lwd->inc_exc_grad_mgga( device_data_ptr.get(), ks_scheme, false, with_weight_derivatives );
+      else if (is_gga) lwd->inc_exc_grad_gga( device_data_ptr.get(), ks_scheme, with_weight_derivatives );
+      else             lwd->inc_exc_grad_lda( device_data_ptr.get(), ks_scheme, with_weight_derivatives );
+
+      // Weight derivative: load eps*w values for this batch
+      {
+        size_t batch_npts = 0;
+        for (auto it = batch_begin; it != task_it; ++it)
+          batch_npts += it->points.size();
+
+        auto* data = dynamic_cast<Scheme1DataBase*>(device_data_ptr.get());
+        auto* backend = dynamic_cast<CUDABackend*>(data->device_backend_);
+        auto base_stack = data->base_stack;
+
+        backend->copy_async( batch_npts, eps_w_all.data() + eps_offset,
+                            base_stack.eps_eval_device, "Copy OneDFT eps*w" );
+        std::vector<double> ones(batch_npts, 1.0);
+        backend->copy_async( batch_npts, ones.data(),
+                            base_stack.den_s_eval_device, "Set den_s=1 for weight deriv" );
+        if (base_stack.den_z_eval_device) {
+          backend->set_zero( batch_npts, base_stack.den_z_eval_device, "Zero den_z for weight deriv" );
+        }
+        backend->master_queue_synchronize();
+
+        eps_offset += batch_npts;
+      }
+
+      lwd->eval_weight_1st_deriv_contracted( device_data_ptr.get(), weight_alg );
+
+    } // batch loop
+  });
+
+  rt.device_backend()->master_queue_synchronize();
+
+  // Retrieve gradient from device
+  double N_EL;
+  device_data_ptr->retrieve_exc_grad_integrands( EXC_GRAD, &N_EL );
+  rt.device_backend()->master_queue_synchronize();
+
+  // Phase 6: Add autograd forces
+  if (!points_grad_local.empty()) {
+    size_t pg_offset = 0;
+    std::stable_sort(tasks.begin(), tasks.end(),
+      [](const auto& a, const auto& b) { return a.iParent < b.iParent; });
+    for (const auto& task : tasks) {
+      int iParent = task.iParent;
+      for (size_t ipt = 0; ipt < task.points.size(); ++ipt) {
+        EXC_GRAD[3*iParent + 0] += points_grad_local[(pg_offset + ipt)*3 + 0];
+        EXC_GRAD[3*iParent + 1] += points_grad_local[(pg_offset + ipt)*3 + 1];
+        EXC_GRAD[3*iParent + 2] += points_grad_local[(pg_offset + ipt)*3 + 2];
+      }
+      pg_offset += task.points.size();
+    }
+  }
+
+  if (!coords_grad_global.empty() && world_rank == 0) {
+    for (int a = 0; a < natoms; ++a) {
+      EXC_GRAD[3*a + 0] += coords_grad_global[3*a + 0];
+      EXC_GRAD[3*a + 1] += coords_grad_global[3*a + 1];
+      EXC_GRAD[3*a + 2] += coords_grad_global[3*a + 2];
+    }
+  }
+
+  // Phase 7: Allreduce
+  this->timer_.time_op("XCIntegrator.Allreduce", [&](){
+    if( not this->reduction_driver_->takes_host_memory() )
+      GAUXC_GENERIC_EXCEPTION("This Module Only Works With Host Reductions");
+    this->reduction_driver_->allreduce_inplace( EXC_GRAD, 3*natoms, ReductionOp::Sum );
+  });
+}
+
 } // namespace GauXC::detail

@@ -897,5 +897,577 @@ void send_buffer_onedft_outputs(const int ndm, const FeatureDict features_dict, 
 // }
 
 
+// ============================================================================
+// OneDFT EXC Gradient
+// ============================================================================
+
+template <typename ValueType>
+void ReferenceReplicatedXCHostIntegrator<ValueType>::
+  eval_exc_grad_onedft_( int64_t m, int64_t n, const value_type* Ps, int64_t ldps,
+                         const value_type* Pz, int64_t ldpz,
+                         value_type* EXC_GRAD, const IntegratorSettingsXC& settings ) {
+
+  const auto& basis = this->load_balancer_->basis();
+  const int64_t nbf = basis.nbf();
+  if( m != n )    GAUXC_GENERIC_EXCEPTION("P Must Be Square");
+  if( m != nbf )  GAUXC_GENERIC_EXCEPTION("P Must Have Same Dimension as Basis");
+  if( ldps < nbf) GAUXC_GENERIC_EXCEPTION("Invalid LDPS");
+  if( ldpz && ldpz < nbf ) GAUXC_GENERIC_EXCEPTION("Invalid LDPZ");
+
+  const bool is_uks = (Pz != nullptr);
+  const int ndm = is_uks ? 2 : 1;
+
+  // Get Tasks
+  auto& tasks = this->load_balancer_->get_tasks();
+#ifdef GAUXC_HAS_DEVICE
+  auto rt  = detail::as_device_runtime(this->load_balancer_->runtime());
+#else
+  auto rt = this->load_balancer_->runtime();
+#endif
+  int32_t world_rank = rt.comm_rank();
+  int32_t world_size = rt.comm_size();
+
+  // Load model
+  OneDFTSettings onedft_settings;
+  if( auto* tmp = dynamic_cast<const OneDFTSettings*>(&settings) ) {
+    onedft_settings = *tmp;
+  }
+  const auto model_path = onedft_settings.model;
+  torch::DeviceType device = torch::kCPU;
+  auto [exc_func, feature_keys] = load_model(model_path, device);
+
+  // Determine feature requirements
+  bool is_gga = false;
+  bool is_mgga = false;
+  for (const auto& key : feature_keys) {
+    if ( not valueExists(key) ) GAUXC_GENERIC_EXCEPTION("Feature Key Required Not Implemented: " + key);
+    if (key == feat_map.at(ONEDFT_FEATURE::TAU)) is_mgga = true;
+    if (key == feat_map.at(ONEDFT_FEATURE::DDEN)) is_gga = true;
+  }
+  if (is_mgga) is_gga = false;
+
+  value_type N_EL;
+
+  // Step 1: Pre-work (basis eval, density computation)
+  this->timer_.time_op("XCIntegrator.LocalWork", [&](){
+    pre_onedft_local_work_( basis, Ps, ldps, Pz, ldpz, &N_EL, is_gga, is_mgga, false);
+  });
+
+  // Step 2: Gather features and build torch tensors
+  std::vector<int> sendcounts(world_size, 0);
+  std::vector<int> displs(world_size, 0);
+  std::vector<int64_t> atom_reorder_inv_perm;
+  FeatureDict features_dict = prepare_onedft_features(ndm, tasks,
+    this->load_balancer_->molecule(), feature_keys, rt,
+    sendcounts, displs, atom_reorder_inv_perm);
+
+  // Step 3: Forward + backward with grad on points and coords
+  std::vector<double> eps_on_grid_global; // exc_on_grid values for weight derivative
+  std::vector<double> points_grad_global; // [total_npts * 3]
+  std::vector<double> coords_grad_global; // [natoms * 3]
+  const int natoms = this->load_balancer_->molecule().natoms();
+  int total_npts_global = 0;
+
+  if (world_rank == 0) {
+    // Enable requires_grad on points and coords tensors
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::POINTS)) != features_dict.end()) {
+      features_dict.at(feat_map.at(ONEDFT_FEATURE::POINTS)).requires_grad_(true);
+    }
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::COORDS)) != features_dict.end()) {
+      features_dict.at(feat_map.at(ONEDFT_FEATURE::COORDS)).requires_grad_(true);
+    }
+
+    auto exc_on_grid = get_exc(exc_func, features_dict);
+    if (exc_on_grid.isnan().any().item<bool>()) {
+      GAUXC_GENERIC_EXCEPTION("exc_on_grid has NaN");
+    }
+    auto exc = (exc_on_grid * features_dict.at(feat_map.at(ONEDFT_FEATURE::WEIGHTS))).sum();
+    exc.backward();
+
+    // Extract eps_on_grid for weight derivative term
+    total_npts_global = exc_on_grid.size(0);
+    at::Tensor eps_cpu = exc_on_grid.detach().cpu().contiguous();
+    eps_on_grid_global.resize(total_npts_global);
+    std::memcpy(eps_on_grid_global.data(), eps_cpu.data_ptr<double>(), total_npts_global * sizeof(double));
+
+    // Extract points.grad() -> per-grid-point forces
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::POINTS)) != features_dict.end()) {
+      auto pg = features_dict.at(feat_map.at(ONEDFT_FEATURE::POINTS)).grad();
+      if (pg.defined()) {
+        at::Tensor pg_cpu = pg.cpu().contiguous();
+        points_grad_global.resize(total_npts_global * 3);
+        std::memcpy(points_grad_global.data(), pg_cpu.data_ptr<double>(), total_npts_global * 3 * sizeof(double));
+      }
+    }
+
+    // Extract coords.grad() -> per-atom forces
+    if (features_dict.find(feat_map.at(ONEDFT_FEATURE::COORDS)) != features_dict.end()) {
+      auto cg = features_dict.at(feat_map.at(ONEDFT_FEATURE::COORDS)).grad();
+      if (cg.defined()) {
+        at::Tensor cg_cpu = cg.cpu().contiguous();
+        coords_grad_global.resize(natoms * 3);
+        std::memcpy(coords_grad_global.data(), cg_cpu.data_ptr<double>(), natoms * 3 * sizeof(double));
+      }
+    }
+
+    // Reorder eps_on_grid from atom-order back to rank-order for scatter
+    if (!atom_reorder_inv_perm.empty()) {
+      std::vector<double> tmp(total_npts_global);
+      for (int64_t i = 0; i < total_npts_global; i++) {
+        tmp[atom_reorder_inv_perm[i]] = eps_on_grid_global[i];
+      }
+      eps_on_grid_global = std::move(tmp);
+
+      // Also reorder points_grad
+      if (!points_grad_global.empty()) {
+        std::vector<double> tmp3(total_npts_global * 3);
+        for (int64_t i = 0; i < total_npts_global; i++) {
+          int64_t j = atom_reorder_inv_perm[i];
+          tmp3[j*3+0] = points_grad_global[i*3+0];
+          tmp3[j*3+1] = points_grad_global[i*3+1];
+          tmp3[j*3+2] = points_grad_global[i*3+2];
+        }
+        points_grad_global = std::move(tmp3);
+      }
+    }
+  }
+
+  // Step 4: Scatter Vxc back to tasks
+  send_buffer_onedft_outputs(ndm, features_dict, tasks, rt, sendcounts, displs, atom_reorder_inv_perm);
+
+  // Scatter eps_on_grid and points_grad to local ranks
+  std::vector<double> eps_on_grid_local;
+  std::vector<double> points_grad_local;
+  if (world_size == 1) {
+    eps_on_grid_local = std::move(eps_on_grid_global);
+    points_grad_local = std::move(points_grad_global);
+  } else {
+#ifdef GAUXC_HAS_MPI
+    // Broadcast total_npts so all ranks know the global size
+    MPI_Bcast(&total_npts_global, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Scatter sendcounts so each rank knows its local count
+    int local_npts = 0;
+    MPI_Scatter(sendcounts.data(), 1, MPI_INT, &local_npts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+
+    // Scatter eps_on_grid
+    eps_on_grid_local.resize(local_npts);
+    MPI_Scatterv(eps_on_grid_global.data(), sendcounts.data(), displs.data(), MPI_DOUBLE,
+                 eps_on_grid_local.data(), local_npts, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+    // Scatter points_grad (stride 3)
+    bool has_points_grad = !points_grad_global.empty();
+    MPI_Bcast(&has_points_grad, 1, MPI_C_BOOL, 0, MPI_COMM_WORLD);
+    if (has_points_grad) {
+      std::vector<int> sendcounts3(world_size), displs3(world_size);
+      for (int i = 0; i < world_size; ++i) {
+        sendcounts3[i] = sendcounts[i] * 3;
+        displs3[i] = displs[i] * 3;
+      }
+      points_grad_local.resize(local_npts * 3);
+      MPI_Scatterv(points_grad_global.data(), sendcounts3.data(), displs3.data(), MPI_DOUBLE,
+                   points_grad_local.data(), local_npts * 3, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    }
+#else
+    GAUXC_GENERIC_EXCEPTION("MPI not available but comm_size > 1");
+#endif
+  }
+
+  // Zero out EXC_GRAD
+  for (int i = 0; i < 3*natoms; ++i) EXC_GRAD[i] = 0.0;
+
+  // Step 5: Add autograd forces BEFORE Pulay (which re-sorts tasks!)
+  // points.grad gives ∂E/∂r_g. Since grid points move with their parent atom,
+  // the force on atom A = Σ_{g∈A} points_grad[g].
+  // NOTE: Must be done while tasks are still in iParent-sorted order
+  //       (matching the scattered layout). exc_grad_local_work_onedft_
+  //       re-sorts tasks by workload, breaking the correspondence.
+  if (!points_grad_local.empty()) {
+    size_t offset = 0;
+    for (const auto& task : tasks) {
+      int iParent = task.iParent;
+      for (size_t ipt = 0; ipt < task.points.size(); ++ipt) {
+        EXC_GRAD[3*iParent + 0] += points_grad_local[(offset + ipt)*3 + 0];
+        EXC_GRAD[3*iParent + 1] += points_grad_local[(offset + ipt)*3 + 1];
+        EXC_GRAD[3*iParent + 2] += points_grad_local[(offset + ipt)*3 + 2];
+      }
+      offset += task.points.size();
+    }
+  }
+
+  // coords.grad gives ∂E/∂R_A directly (no task-order dependence)
+  // Only rank 0 has coords_grad; will be allreduced at the end
+  if (!coords_grad_global.empty() && world_rank == 0) {
+    for (int a = 0; a < natoms; ++a) {
+      EXC_GRAD[3*a + 0] += coords_grad_global[3*a + 0];
+      EXC_GRAD[3*a + 1] += coords_grad_global[3*a + 1];
+      EXC_GRAD[3*a + 2] += coords_grad_global[3*a + 2];
+    }
+  }
+
+  // Step 6: Pulay + weight derivative term (re-sorts tasks internally!)
+  this->timer_.time_op("XCIntegrator.LocalWork2", [&](){
+    exc_grad_local_work_onedft_( Ps, ldps, Pz, ldpz, EXC_GRAD, eps_on_grid_local, is_gga, is_mgga);
+  });
+
+  // Step 7: Allreduce
+  this->timer_.time_op("XCIntegrator.Allreduce", [&](){
+    if( not this->reduction_driver_->takes_host_memory() )
+      GAUXC_GENERIC_EXCEPTION("This Module Only Works With Host Reductions");
+    this->reduction_driver_->allreduce_inplace( EXC_GRAD, 3*natoms, ReductionOp::Sum );
+  });
+}
+
+
+// Pulay + weight derivative local work using OneDFT Vxc format
+template <typename ValueType>
+void ReferenceReplicatedXCHostIntegrator<ValueType>::
+  exc_grad_local_work_onedft_( const value_type* Ps, int64_t ldps,
+                               const value_type* Pz, int64_t ldpz,
+                               value_type* EXC_GRAD,
+                               const std::vector<double>& eps_on_grid,
+                               const bool is_gga, const bool is_mgga) {
+
+  const bool is_uks = Pz != nullptr;
+
+  auto* lwd = dynamic_cast<LocalHostWorkDriver*>(this->local_work_driver_.get());
+
+  const auto& basis = this->load_balancer_->basis();
+  const auto& mol   = this->load_balancer_->molecule();
+  const auto& molmeta = this->load_balancer_->molmeta();
+
+  // Weight derivative settings
+  auto& lb_state = this->load_balancer_->state();
+  if( not lb_state.modified_weights_are_stored ) {
+    GAUXC_GENERIC_EXCEPTION("Weights Have Not Been Modified");
+  }
+  XCWeightAlg& weight_alg = lb_state.weight_alg;
+
+  BasisSetMap basis_map(basis, mol);
+  const int32_t nbf = basis.nbf();
+  const int32_t natoms = mol.natoms();
+
+  auto& tasks = this->load_balancer_->get_tasks();
+  const size_t ntasks = tasks.size();
+
+  // Sort tasks for load balancing
+  auto task_comparator = []( const XCTask& a, const XCTask& b ) {
+    return (a.points.size() * a.bfn_screening.nbe) > (b.points.size() * b.bfn_screening.nbe);
+  };
+
+  // Build task -> eps mapping from the eps_on_grid vector (in iParent-sorted order)
+  // First, re-sort back to iParent order to match eps_on_grid
+  std::stable_sort( tasks.begin(), tasks.end(),
+    [](const auto& a, const auto& b) { return a.iParent < b.iParent; });
+
+  // Distribute eps_on_grid to per-task storage
+  {
+    size_t offset = 0;
+    for (auto& task : tasks) {
+      int64_t npts = task.points.size();
+      task.feat.eps.resize(npts);
+      std::copy(eps_on_grid.data() + offset,
+                eps_on_grid.data() + offset + npts,
+                task.feat.eps.begin());
+      offset += npts;
+    }
+  }
+
+  // Now sort by workload for the Pulay loop
+  std::sort( tasks.begin(), tasks.end(), task_comparator );
+
+  #pragma omp parallel
+  {
+
+  XCHostData<value_type> host_data;
+
+  #pragma omp for schedule(dynamic)
+  for( size_t iT = 0; iT < ntasks; ++iT ) {
+
+    auto& task = tasks[iT];
+    const int32_t  npts    = task.points.size();
+    const int32_t  nbe     = task.bfn_screening.nbe;
+    const int32_t  nshells = task.bfn_screening.shell_list.size();
+
+    const auto* points      = task.points.data()->data();
+    const auto* weights     = task.weights.data();
+    const int32_t* shell_list = task.bfn_screening.shell_list.data();
+
+    // Allocate memory for basis evaluation (up to hessian for GGA/MGGA)
+    if (is_gga || is_mgga) {
+      host_data.basis_eval.resize(10 * npts * nbe); // B, dB_xyz, d2B_6
+      host_data.zmat.resize(4 * (is_uks ? 2 : 1) * npts * nbe);
+    } else {
+      host_data.basis_eval.resize(4 * npts * nbe);  // B, dB_xyz
+      host_data.zmat.resize((is_uks ? 2 : 1) * npts * nbe);
+    }
+    host_data.nbe_scr.resize(nbe * nbe);
+    host_data.eps.resize(npts);
+
+    auto* basis_eval = host_data.basis_eval.data();
+    auto* nbe_scr    = host_data.nbe_scr.data();
+    auto* eps_buf    = host_data.eps.data();
+
+    auto* dbasis_x_eval = basis_eval    + npts * nbe;
+    auto* dbasis_y_eval = dbasis_x_eval + npts * nbe;
+    auto* dbasis_z_eval = dbasis_y_eval + npts * nbe;
+
+    value_type* d2basis_xx_eval = nullptr;
+    value_type* d2basis_xy_eval = nullptr;
+    value_type* d2basis_xz_eval = nullptr;
+    value_type* d2basis_yy_eval = nullptr;
+    value_type* d2basis_yz_eval = nullptr;
+    value_type* d2basis_zz_eval = nullptr;
+
+    if (is_gga || is_mgga) {
+      d2basis_xx_eval = dbasis_z_eval   + npts * nbe;
+      d2basis_xy_eval = d2basis_xx_eval + npts * nbe;
+      d2basis_xz_eval = d2basis_xy_eval + npts * nbe;
+      d2basis_yy_eval = d2basis_xz_eval + npts * nbe;
+      d2basis_yz_eval = d2basis_yy_eval + npts * nbe;
+      d2basis_zz_eval = d2basis_yz_eval + npts * nbe;
+    }
+
+    // X-matrix pointers
+    auto* xNmat = host_data.zmat.data();
+    value_type* xNmat_x = nullptr;
+    value_type* xNmat_y = nullptr;
+    value_type* xNmat_z = nullptr;
+    value_type* xZmat   = nullptr;
+    value_type* xZmat_x = nullptr;
+    value_type* xZmat_y = nullptr;
+    value_type* xZmat_z = nullptr;
+
+    if (is_gga || is_mgga) {
+      xNmat_x = xNmat   + npts*nbe;
+      xNmat_y = xNmat_x + npts*nbe;
+      xNmat_z = xNmat_y + npts*nbe;
+      if (is_uks) {
+        xZmat   = xNmat_z + npts*nbe;
+        xZmat_x = xZmat   + npts*nbe;
+        xZmat_y = xZmat_x + npts*nbe;
+        xZmat_z = xZmat_y + npts*nbe;
+      }
+    } else {
+      if (is_uks) {
+        xZmat = xNmat + npts*nbe;
+      }
+    }
+
+    // Get submat map
+    auto [submat_map, foo] =
+      gen_compressed_submat_map( basis_map, task.bfn_screening.shell_list, nbf, nbf );
+
+    // Evaluate collocation (gradient + hessian for GGA/MGGA)
+    if (is_gga || is_mgga) {
+      lwd->eval_collocation_hessian( npts, nshells, nbe, points, basis, shell_list,
+        basis_eval, dbasis_x_eval, dbasis_y_eval, dbasis_z_eval,
+        d2basis_xx_eval, d2basis_xy_eval, d2basis_xz_eval,
+        d2basis_yy_eval, d2basis_yz_eval, d2basis_zz_eval );
+    } else {
+      lwd->eval_collocation_gradient( npts, nshells, nbe, points, basis, shell_list,
+        basis_eval, dbasis_x_eval, dbasis_y_eval, dbasis_z_eval );
+    }
+
+    // Evaluate X-matrices: xN = Ps * B (and xZ = Pz * B for UKS)
+    const int xmat_len = (is_gga || is_mgga) ? 4 : 1;
+    lwd->eval_xmat( xmat_len*npts, nbf, nbe, submat_map, 1.0, Ps, ldps, basis_eval, nbe,
+                    xNmat, nbe, nbe_scr );
+    if (is_uks) {
+      lwd->eval_xmat( xmat_len*npts, nbf, nbe, submat_map, 1.0, Pz, ldpz, basis_eval, nbe,
+                      xZmat, nbe, nbe_scr );
+    }
+
+    // Read OneDFT Vxc from task.feat (already includes grid weights from autograd)
+    // For RKS: vdden_a holds the total density derivative, vdden_b is zero
+    const value_type* vdden_a = task.feat.vdden_eval_a.data();
+    const value_type* vdden_b = is_uks ? task.feat.vdden_eval_b.data() : nullptr;
+    const value_type* vdden_x_a = nullptr;
+    const value_type* vdden_y_a = nullptr;
+    const value_type* vdden_z_a = nullptr;
+    const value_type* vdden_x_b = nullptr;
+    const value_type* vdden_y_b = nullptr;
+    const value_type* vdden_z_b = nullptr;
+    const value_type* vtau_data = nullptr;
+
+    if (is_gga || is_mgga) {
+      vdden_x_a = task.feat.vdden_x_eval_a.data();
+      vdden_y_a = task.feat.vdden_y_eval_a.data();
+      vdden_z_a = task.feat.vdden_z_eval_a.data();
+      if (is_uks) {
+        vdden_x_b = task.feat.vdden_x_eval_b.data();
+        vdden_y_b = task.feat.vdden_y_eval_b.data();
+        vdden_z_b = task.feat.vdden_z_eval_b.data();
+      }
+    }
+    if (is_mgga) {
+      vtau_data = task.feat.vtau.data();
+    }
+
+    // --- Weight derivative term ---
+    // eps_contracted[ipt] = exc_on_grid[ipt] * w[ipt]
+    for (int ipt = 0; ipt < npts; ++ipt) {
+      eps_buf[ipt] = task.feat.eps[ipt] * weights[ipt];
+    }
+    lwd->eval_weight_1st_deriv_contracted( weight_alg, mol, molmeta,
+      task, eps_buf, EXC_GRAD);
+
+    // --- Pulay gradient loop ---
+    // Using OneDFT's native per-component Vxc (weights already included)
+    size_t bf_off = 0;
+    for (auto ish = 0; ish < nshells; ++ish) {
+      const int sh_idx = shell_list[ish];
+      const int sh_sz  = basis[sh_idx].size();
+      const int iAt    = basis_map.shell_to_center( sh_idx );
+
+      // Skip basis functions on the parent atom (handled by weight derivative)
+      if (iAt == task.iParent) {
+        bf_off += sh_sz;
+        continue;
+      }
+
+      double g_acc_x(0), g_acc_y(0), g_acc_z(0);
+
+      for (int ibf = 0, mu = bf_off; ibf < sh_sz; ++ibf, ++mu)
+      for (int ipt = 0; ipt < npts; ++ipt) {
+
+        const int32_t mu_i = mu + ipt*nbe;
+
+        // OneDFT Vxc: vdden_a = w * ∂ε/∂ρ_α, vdden_b = w * ∂ε/∂ρ_β
+        // For UKS: vrho_s = vdden_a + vdden_b, vrho_z = vdden_a - vdden_b
+        // For RKS: vrho_s = vdden_a (the only component)
+        const double vrho_s = is_uks ? (vdden_a[ipt] + vdden_b[ipt]) : vdden_a[ipt];
+
+        const double xN = xNmat[mu_i];
+
+        const double dbx = dbasis_x_eval[mu_i];
+        const double dby = dbasis_y_eval[mu_i];
+        const double dbz = dbasis_z_eval[mu_i];
+
+        // LDA contribution (no separate weight multiplication — already in Vxc)
+        g_acc_x += 0.5 * vrho_s * xN * dbx;
+        g_acc_y += 0.5 * vrho_s * xN * dby;
+        g_acc_z += 0.5 * vrho_s * xN * dbz;
+
+        if (is_uks) {
+          const double vrho_z = vdden_a[ipt] - vdden_b[ipt];
+          const double xZ = xZmat[mu_i];
+          g_acc_x += 0.5 * vrho_z * xZ * dbx;
+          g_acc_y += 0.5 * vrho_z * xZ * dby;
+          g_acc_z += 0.5 * vrho_z * xZ * dbz;
+        }
+
+        if (is_gga || is_mgga) {
+          // GGA contribution using OneDFT per-component derivatives
+          const double vds_x = is_uks ? 0.5 * (vdden_x_a[ipt] + vdden_x_b[ipt]) : 0.5 * vdden_x_a[ipt];
+          const double vds_y = is_uks ? 0.5 * (vdden_y_a[ipt] + vdden_y_b[ipt]) : 0.5 * vdden_y_a[ipt];
+          const double vds_z = is_uks ? 0.5 * (vdden_z_a[ipt] + vdden_z_b[ipt]) : 0.5 * vdden_z_a[ipt];
+
+          const double xNx = xNmat_x[mu_i];
+          const double xNy = xNmat_y[mu_i];
+          const double xNz = xNmat_z[mu_i];
+
+          const double d2bxx = d2basis_xx_eval[mu_i];
+          const double d2bxy = d2basis_xy_eval[mu_i];
+          const double d2bxz = d2basis_xz_eval[mu_i];
+          const double d2byy = d2basis_yy_eval[mu_i];
+          const double d2byz = d2basis_yz_eval[mu_i];
+          const double d2bzz = d2basis_zz_eval[mu_i];
+
+          // s (total) contribution
+          g_acc_x += vds_x * (d2bxx * xN + dbx * xNx) + vds_y * (d2bxy * xN + dbx * xNy) + vds_z * (d2bxz * xN + dbx * xNz);
+          g_acc_y += vds_x * (d2bxy * xN + dby * xNx) + vds_y * (d2byy * xN + dby * xNy) + vds_z * (d2byz * xN + dby * xNz);
+          g_acc_z += vds_x * (d2bxz * xN + dbz * xNx) + vds_y * (d2byz * xN + dbz * xNy) + vds_z * (d2bzz * xN + dbz * xNz);
+
+          if (is_uks) {
+            const double vdz_x = 0.5 * (vdden_x_a[ipt] - vdden_x_b[ipt]);
+            const double vdz_y = 0.5 * (vdden_y_a[ipt] - vdden_y_b[ipt]);
+            const double vdz_z = 0.5 * (vdden_z_a[ipt] - vdden_z_b[ipt]);
+
+            const double xZx = xZmat_x[mu_i];
+            const double xZy = xZmat_y[mu_i];
+            const double xZz = xZmat_z[mu_i];
+            const double xZ  = xZmat[mu_i];
+
+            g_acc_x += vdz_x * (d2bxx * xZ + dbx * xZx) + vdz_y * (d2bxy * xZ + dbx * xZy) + vdz_z * (d2bxz * xZ + dbx * xZz);
+            g_acc_y += vdz_x * (d2bxy * xZ + dby * xZx) + vdz_y * (d2byy * xZ + dby * xZy) + vdz_z * (d2byz * xZ + dby * xZz);
+            g_acc_z += vdz_x * (d2bxz * xZ + dbz * xZx) + vdz_y * (d2byz * xZ + dbz * xZy) + vdz_z * (d2bzz * xZ + dbz * xZz);
+          }
+        }
+
+        if (is_mgga) {
+          // MGGA τ contribution
+          // For UKS: vtau interleaved [α₀, β₀, α₁, β₁, ...]
+          // For RKS: vtau has single component per point
+          double vtaun;
+          if (is_uks) {
+            const double vtaup = 0.5 * vtau_data[2*ipt];
+            const double vtaum = 0.5 * vtau_data[2*ipt + 1];
+            vtaun = vtaup + vtaum;
+          } else {
+            vtaun = 0.5 * vtau_data[ipt];
+          }
+
+          const double xNx = xNmat_x[mu_i];
+          const double xNy = xNmat_y[mu_i];
+          const double xNz = xNmat_z[mu_i];
+
+          const double d2bxx = d2basis_xx_eval[mu_i];
+          const double d2bxy = d2basis_xy_eval[mu_i];
+          const double d2bxz = d2basis_xz_eval[mu_i];
+          const double d2byy = d2basis_yy_eval[mu_i];
+          const double d2byz = d2basis_yz_eval[mu_i];
+          const double d2bzz = d2basis_zz_eval[mu_i];
+
+          auto d2_term_x = d2bxx * xNx + d2bxy * xNy + d2bxz * xNz;
+          auto d2_term_y = d2bxy * xNx + d2byy * xNy + d2byz * xNz;
+          auto d2_term_z = d2bxz * xNx + d2byz * xNy + d2bzz * xNz;
+
+          g_acc_x += 0.5 * vtaun * d2_term_x;
+          g_acc_y += 0.5 * vtaun * d2_term_y;
+          g_acc_z += 0.5 * vtaun * d2_term_z;
+
+          if (is_uks) {
+            const double vtauz = 0.5 * vtau_data[2*ipt] - 0.5 * vtau_data[2*ipt + 1];
+            const double xZx = xZmat_x[mu_i];
+            const double xZy = xZmat_y[mu_i];
+            const double xZz = xZmat_z[mu_i];
+
+            d2_term_x = d2bxx * xZx + d2bxy * xZy + d2bxz * xZz;
+            d2_term_y = d2bxy * xZx + d2byy * xZy + d2byz * xZz;
+            d2_term_z = d2bxz * xZx + d2byz * xZy + d2bzz * xZz;
+
+            g_acc_x += 0.5 * vtauz * d2_term_x;
+            g_acc_y += 0.5 * vtauz * d2_term_y;
+            g_acc_z += 0.5 * vtauz * d2_term_z;
+          }
+        }
+
+      } // end loop over bfns + grid points
+
+      #pragma omp atomic
+      EXC_GRAD[3*iAt + 0] += -2 * g_acc_x;
+      #pragma omp atomic
+      EXC_GRAD[3*iAt + 1] += -2 * g_acc_y;
+      #pragma omp atomic
+      EXC_GRAD[3*iAt + 2] += -2 * g_acc_z;
+
+      // Weight derivative counterpart for non-parent atoms
+      #pragma omp atomic
+      EXC_GRAD[3*task.iParent + 0] -= -2 * g_acc_x;
+      #pragma omp atomic
+      EXC_GRAD[3*task.iParent + 1] -= -2 * g_acc_y;
+      #pragma omp atomic
+      EXC_GRAD[3*task.iParent + 2] -= -2 * g_acc_z;
+
+      bf_off += sh_sz;
+
+    } // end loop over shells
+
+  } // end loop over tasks
+
+  } // end OpenMP region
+}
+
 } // namespace detail
 } // namespace GauXC
