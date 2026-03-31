@@ -273,6 +273,7 @@ eval_exc_vxc_onedft_( int64_t m, int64_t n,
     auto exc = (exc_on_grid * features_dict.at(feat_map.at(ONEDFT_FEATURE::WEIGHTS))).sum();
     // if do_vxc
     exc.backward();
+    c10::cuda::CUDACachingAllocator::emptyCache();
     EXC[0] = exc.item<double>();
   } else {
     EXC[0] = 0.0;
