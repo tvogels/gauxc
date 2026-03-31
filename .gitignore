@@ -13,3 +13,6 @@ build/
 build-*/
 _build/
 cmake-build-*/
+
+# Docs not yet tracked
+BUILD.md
