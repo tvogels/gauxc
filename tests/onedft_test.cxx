@@ -96,6 +96,142 @@ void test_onedft_integrator( ExecutionSpace ex, const RuntimeEnvironment& rt,
     }
 }
 
+// Finite-difference gradient test for OneDFT
+void test_onedft_gradient( ExecutionSpace ex, const RuntimeEnvironment& rt,
+    std::string reference_file,
+    std::string onedft_model_path,
+    bool is_uks,
+    std::string integrator_kernel = "Default",
+    std::string reduction_kernel  = "Default",
+    std::string lwd_kernel        = "Default") {
+
+    using matrix_type = Eigen::MatrixXd;
+    Molecule mol;
+    BasisSet<double> basis;
+    matrix_type P, Pz;
+
+    read_hdf5_record( mol,   reference_file, "/MOLECULE" );
+    read_hdf5_record( basis, reference_file, "/BASIS"    );
+
+    HighFive::File file( reference_file, HighFive::File::ReadOnly );
+
+    auto dset = file.getDataSet("/DENSITY_SCALAR");
+    auto dims = dset.getDimensions();
+    P  = matrix_type( dims[0], dims[1] );
+    Pz = matrix_type( dims[0], dims[1] );
+    dset.read( P.data() );
+    dset = file.getDataSet("/DENSITY_Z");
+    dset.read( Pz.data() );
+
+    const int natoms = mol.size();
+
+    // Helper lambda to compute OneDFT energy at a given geometry
+    auto compute_energy = [&](const Molecule& mol_pert) -> double {
+      auto mg = MolGridFactory::create_default_molgrid(mol_pert, PruningScheme::Unpruned,
+          BatchSize(512), RadialQuad::MuraKnowles, AtomicGridSizeDefault::UltraFineGrid);
+      LoadBalancerFactory lb_factory(ex, "Default");
+      auto lb = lb_factory.get_instance(rt, mol_pert, mg, basis);
+      MolecularWeightsFactory mw_factory( ex, "Default", MolecularWeightsSettings{} );
+      auto mw = mw_factory.get_instance();
+      mw.modify_weights(lb);
+      functional_type func = functional_type( ExchCXX::Backend::builtin,
+          ExchCXX::Functional::PBE0, ExchCXX::Spin::Unpolarized );
+      XCIntegratorFactory<matrix_type> integrator_factory( ex, "Replicated",
+          integrator_kernel, lwd_kernel, reduction_kernel );
+      auto integrator = integrator_factory.get_instance( func, lb );
+
+      OneDFTSettings onedft_settings;
+      onedft_settings.model = onedft_model_path;
+      auto [ EXC, VXC, VXCz ] = integrator.eval_exc_vxc_onedft( P, Pz, onedft_settings );
+      return EXC;
+    };
+
+    // Compute analytic gradient
+    auto mg = MolGridFactory::create_default_molgrid(mol, PruningScheme::Unpruned,
+        BatchSize(512), RadialQuad::MuraKnowles, AtomicGridSizeDefault::UltraFineGrid);
+    LoadBalancerFactory lb_factory(ex, "Default");
+    auto lb = lb_factory.get_instance(rt, mol, mg, basis);
+    MolecularWeightsFactory mw_factory( ex, "Default", MolecularWeightsSettings{} );
+    auto mw = mw_factory.get_instance();
+    mw.modify_weights(lb);
+    functional_type func = functional_type( ExchCXX::Backend::builtin,
+        ExchCXX::Functional::PBE0, ExchCXX::Spin::Unpolarized );
+    XCIntegratorFactory<matrix_type> integrator_factory( ex, "Replicated",
+        integrator_kernel, lwd_kernel, reduction_kernel );
+    auto integrator = integrator_factory.get_instance( func, lb );
+
+    OneDFTSettings onedft_settings;
+    onedft_settings.model = onedft_model_path;
+    auto EXC_GRAD = is_uks ?
+      integrator.eval_exc_grad_onedft( P, Pz, onedft_settings ) :
+      integrator.eval_exc_grad_onedft( P, Pz, onedft_settings ); // RKS would pass (P, zero_matrix)
+
+    // Finite-difference gradient
+    const double h = 1e-4; // step size in Bohr
+    std::vector<double> fd_grad(3 * natoms, 0.0);
+
+    for (int iatom = 0; iatom < natoms; ++iatom) {
+      for (int icoord = 0; icoord < 3; ++icoord) {
+        // +h perturbation
+        Molecule mol_plus = mol;
+        double* coord_p = (icoord == 0) ? &mol_plus[iatom].x :
+                          (icoord == 1) ? &mol_plus[iatom].y : &mol_plus[iatom].z;
+        *coord_p += h;
+        double E_plus = compute_energy(mol_plus);
+
+        // -h perturbation
+        Molecule mol_minus = mol;
+        double* coord_m = (icoord == 0) ? &mol_minus[iatom].x :
+                          (icoord == 1) ? &mol_minus[iatom].y : &mol_minus[iatom].z;
+        *coord_m -= h;
+        double E_minus = compute_energy(mol_minus);
+
+        fd_grad[3*iatom + icoord] = (E_plus - E_minus) / (2 * h);
+      }
+    }
+
+    // Compare analytic vs finite-difference gradient
+    double max_err = 0.0;
+    for (int i = 0; i < 3*natoms; ++i) {
+      double err = std::abs(EXC_GRAD[i] - fd_grad[i]);
+      max_err = std::max(max_err, err);
+      INFO("Component " << i << ": analytic=" << EXC_GRAD[i]
+           << " FD=" << fd_grad[i] << " err=" << err);
+      // h=1e-4 gives FD accuracy ~h^2 = 1e-8, but with grid reconstruction
+      // errors we expect ~1e-5 to 1e-6 agreement
+      CHECK( err < 1e-4 );
+    }
+    INFO("Max gradient error: " << max_err);
+}
+
+void test_gradient(std::string reference_file, std::string onedft_model_path,
+                   bool is_uks, bool use_cpu = true, bool use_gpu = true) {
+
+#ifdef GAUXC_HAS_DEVICE
+    auto rt = DeviceRuntimeEnvironment(GAUXC_MPI_CODE(MPI_COMM_WORLD,) 0.9);
+#else
+    auto rt = RuntimeEnvironment(GAUXC_MPI_CODE(MPI_COMM_WORLD));
+#endif
+
+#ifdef GAUXC_HAS_HOST
+    if (use_cpu) {
+        SECTION( "Host" ) {
+        test_onedft_gradient( ExecutionSpace::Host, rt,
+            reference_file, onedft_model_path, is_uks );
+        }
+    }
+#endif
+
+#ifdef GAUXC_HAS_DEVICE
+    if (use_gpu) {
+        SECTION( "Device" ) {
+        test_onedft_gradient( ExecutionSpace::Device, rt,
+            reference_file, onedft_model_path, is_uks );
+        }
+    }
+#endif
+}
+
 void test_integrator(std::string reference_file, std::string onedft_model_path, bool use_cpu = true, bool use_gpu = true) {
 
 #ifdef GAUXC_HAS_DEVICE
@@ -149,6 +285,20 @@ TEST_CASE( "OneDFT", "[onedft]" ) {
     SECTION( " HE / def2-qzvp / lda.fun" ) {
         test_integrator( GAUXC_REF_DATA_PATH "/onedft_he_def2qzvp_lda_uks.hdf5", GAUXC_ONEDFT_MODEL_PATH "/lda.fun" );
         }
+}
+
+TEST_CASE( "OneDFT Gradient", "[onedft][gradient]" ) {
+    // Note: Gradient test uses finite-difference validation against OneDFT energy.
+    // The test molecule should have >1 atom for meaningful forces.
+    // He atom test verifies that single-atom forces are (near) zero.
+    SECTION( " HE / def2-qzvp / pbe.fun - UKS" ) {
+        test_gradient( GAUXC_REF_DATA_PATH "/onedft_he_def2qzvp_pbe_uks.hdf5",
+                       GAUXC_ONEDFT_MODEL_PATH "/pbe.fun", /*is_uks=*/true );
+    }
+    SECTION( " HE / def2-qzvp / lda.fun - UKS" ) {
+        test_gradient( GAUXC_REF_DATA_PATH "/onedft_he_def2qzvp_lda_uks.hdf5",
+                       GAUXC_ONEDFT_MODEL_PATH "/lda.fun", /*is_uks=*/true );
+    }
 }
 
 #include <gauxc/xc_integrator/replicated/impl.hpp>
