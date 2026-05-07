@@ -35,6 +35,7 @@ option( GAUXC_ENABLE_OPENMP     "Enable OpenMP Compilation"   ON  )
 option( GAUXC_ENABLE_TESTS      "Enable Unit Tests"           ON  )
 option( GAUXC_ENABLE_GAU2GRID   "Enable Gau2Grid Collocation" ON  )
 option( GAUXC_ENABLE_HDF5       "Enable HDF5 Bindings"        ON  )
+option( GAUXC_ENABLE_PYTHON     "Enable Python Bindings"      OFF )
 option( GAUXC_USE_FAST_RSQRT    "Enable Fast RSQRT"           OFF )
 option( GAUXC_BLAS_PREFER_ILP64 "Prefer ILP64 for host BLAS"  OFF )
 option( GAUXC_LINK_CUDA_STATIC  "Link GauXC with static CUDA libs"  OFF )
@@ -119,6 +120,10 @@ add_subdirectory( src )
 
 if( CMAKE_PROJECT_NAME STREQUAL PROJECT_NAME AND GAUXC_ENABLE_TESTS AND BUILD_TESTING )
   add_subdirectory( tests )
+endif()
+
+if( GAUXC_ENABLE_PYTHON )
+  add_subdirectory( python )
 endif()
 
 list(REMOVE_AT CMAKE_MODULE_PATH 0)

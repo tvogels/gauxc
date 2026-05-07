@@ -202,6 +202,7 @@ target_link_libraries( my_target PUBLIC gauxc::gauxc )
 | `GAUXC_ENABLE_HOST`        | Enable HOST integrators                                   | `ON`     |
 | `GAUXC_ENABLE_CUDA`        | Enable CUDA integrators                                   | `OFF`    |
 | `GAUXC_ENABLE_HIP`         | Enable HIP integrators                                    | `OFF`    |
+| `GAUXC_ENABLE_PYTHON`      | Enable Python bindings                                    | `OFF`    |
 | `GAUXC_ENABLE_MAGMA`       | Enable MAGMA for batched BLAS (No effect if no GPU)       | `ON`     |
 | `GAUXC_ENABLE_CUTLASS`     | Enable CUTLASS for batched BLAS (No effect if no CUDA)    | `OFF`    |
 | `GAUXC_ENABLE_NCCL`        | Enable NCCL bindings for topology aware GPU reductions    | `OFF`    |
@@ -217,6 +218,57 @@ target_link_libraries( my_target PUBLIC gauxc::gauxc )
 # Example Usage
 
 See `test/standalone_driver.cxx` for an example end-to-end invocation of GauXC for various integrands.
+
+# Python Bindings
+
+GauXC provides Python bindings with PyTorch integration for easy access to GPU-accelerated DFT grid generation and integration. The bindings expose:
+
+- Molecule and basis set construction
+- Molecular grid generation with configurable parameters
+- Grid point and weight extraction
+- PyTorch tensor interoperability (zero-copy via DLPack)
+
+See `python/README.md` and `python/IMPLEMENTATION.md` for complete documentation.
+
+**Installation:**
+```bash
+# From source with Python bindings enabled
+cmake -DGAUXC_ENABLE_PYTHON=ON <build options> <source_dir>
+cmake --build . -j
+pip install -e <source_dir>
+
+# Or directly with pip (requires dependencies)
+pip install .
+```
+
+**Example usage:**
+```python
+import gauxc_py as gxc
+import numpy as np
+
+# Create H2O molecule
+z = np.array([8, 1, 1])  # O, H, H
+coords = np.array([[0.0, 0.0, 0.1], [0.0, 0.8, -0.5], [0.0, -0.8, -0.5]])
+mol = gxc.molecule_from_arrays(z, coords)
+
+# Create basis set (simplified example)
+basis = gxc.BasisSet()
+# ... add shells to basis ...
+
+# Generate high-quality molecular grid
+grid = gxc.compute_grid(
+    mol, basis,
+    pruning_scheme="robust",
+    grid_size="ultrafine",
+    batch_size=512
+)
+
+print(f"Generated grid with {grid.npts} points")
+# grid.points: (npts, 3) array of coordinates
+# grid.weights: (npts,) array of quadrature weights
+```
+
+**Note:** Meta-GGA variable evaluation is currently a stub and requires additional implementation. See `python/IMPLEMENTATION.md` for details on completing this functionality.
 
 
 # License
